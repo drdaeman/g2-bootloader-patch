@@ -33,7 +33,7 @@ def load_case_image():
 
 
 class CaseLink:
-    def __init__(self, port, output, side="right"):
+    def __init__(self, port, output, side="right", stream_transactions=False):
         if side not in ("left", "right"):
             raise ValueError("expected left or right temple")
         self.side = side
@@ -41,6 +41,7 @@ class CaseLink:
         self.device = port
         self.out = Path(output)
         self.out.mkdir(parents=True, exist_ok=False)
+        self.stream_transactions = stream_transactions
         self.port = None
         self.touched = self.ready = False
         self.report = {
@@ -50,6 +51,14 @@ class CaseLink:
             "success": False,
             "case_flash_writes": False,
         }
+
+    def record_transaction(self, event):
+        if self.stream_transactions:
+            self.report["transaction_log"] = "transactions.jsonl"
+            with (self.out / "transactions.jsonl").open("a") as file:
+                file.write(json.dumps(event) + "\n")
+        else:
+            self.save()
 
     def save(self):
         (self.out / "result.json").write_text(json.dumps(self.report, indent=2) + "\n")
@@ -133,8 +142,13 @@ class CaseLink:
         packet = b"G2TX" + bytes((len(frame),)) + frame
         packet += bytes((sum(packet) & 255,))
         event = {"request": frame.hex()}
-        self.report["transactions"].append(event)
-        self.save()
+        if self.stream_transactions:
+            count = self.report.get("transaction_count", 0) + 1
+            self.report["transaction_count"] = count
+            event["sequence"] = count
+        else:
+            self.report["transactions"].append(event)
+        self.record_transaction(event)
         port.write(packet)
         port.flush()
         head = read_exact(port, 6, "relay response")
@@ -142,7 +156,7 @@ class CaseLink:
             raise ValueError("invalid relay header")
         tail = read_exact(port, head[5] + 1, "temple response")
         event["reply"] = (head + tail).hex()
-        self.save()
+        self.record_transaction(event)
         if tail[-1] != (sum(head) + sum(tail[:-1])) & 255:
             raise ValueError("relay checksum mismatch")
         if head[4]:
@@ -223,7 +237,17 @@ class CaseLink:
         self.close()
 
 
-def run(port, code, entry=0, arg0=0, arg1=0, callback=None, output=None, side="right"):
+def run(
+    port,
+    code,
+    entry=0,
+    arg0=0,
+    arg1=0,
+    callback=None,
+    output=None,
+    side="right",
+    source=None,
+):
     """One upload/RUN; explicit release even on failure. Never retry RUN."""
     out = (
         Path(output)
@@ -238,7 +262,7 @@ def run(port, code, entry=0, arg0=0, arg1=0, callback=None, output=None, side="r
         try:
             client = Client(link.exchange)
             client.upload(code, entry, arg0, arg1)
-            result, data = client.execute(callback)
+            result, data = client.execute(callback, source=source)
             (out / "callback.bin").write_bytes(data)
             link.report.update(
                 program_result=result,

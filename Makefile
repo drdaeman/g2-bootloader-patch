@@ -30,7 +30,7 @@ build/bearssl/%.o: vendor/bearssl/src/%.c $(BEARSSL_HEADERS) Makefile
 
 .PHONY: all patch test clean FORCE
 .SECONDARY:
-all: build/patch.bin build/case.bin build/echo.bin build/checksum.bin build/dump.bin
+all: build/patch.bin build/case.bin build/echo.bin build/checksum.bin build/dump.bin build/recover.bin
 build:
 	mkdir -p $@
 build/auth_key.h: FORCE tools/g2patch/auth.py tools/g2patch/artifacts.py tools/patch.py | build

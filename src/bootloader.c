@@ -11,8 +11,8 @@
 #include "wire.h"
 #include "auth.h"
 #define IO_WAIT_TICKS 2048u
-enum { LOAD = 1, DATA, RUN, OUTPUT_ACK };
-enum { ACK, OUTPUT, RESULT, READY, ERROR };
+enum { LOAD = 1, DATA, RUN, OUTPUT_ACK, INPUT_DATA };
+enum { ACK, OUTPUT, RESULT, READY, ERROR, INPUT };
 enum { UNAVAILABLE = 1, BAD_REQUEST, BAD_CRC, ABORTED, IO_ERROR };
 
 typedef struct {
@@ -226,6 +226,29 @@ error:
     *failed = 1;
     return -1;
 }
+__attribute__((used, noinline)) static int recv_input(void *context, void *data,
+                                                      uint32_t size) {
+    int *failed = context;
+    if (*failed)
+        return -1;
+    if (!size)
+        return 0;
+    unsigned capacity = size > 16u ? 16u : size;
+    if (!reply(INPUT, capacity, 0, 0))
+        goto error;
+    uint8_t packet[32];
+    unsigned got = receive(packet, IO_WAIT_TICKS), n = packet[9];
+    if (!command(packet, got, INPUT_DATA) || n > capacity ||
+        crc32(packet + 10, n) != u32(packet + 26))
+        goto error;
+    uint8_t *out = data;
+    for (unsigned i = 0; i < n; i++)
+        out[i] = packet[10 + i];
+    return (int)n;
+error:
+    *failed = 1;
+    return -1;
+}
 static int is_continue(const uint8_t *p, unsigned got) {
     uint8_t expected[9];
     continue_request(expected);
@@ -278,9 +301,10 @@ static void commands(volatile uint32_t *held) {
             program header = available;
             available.length = 0;
             int failed = 0;
-            uintptr_t send;
+            uintptr_t send, recv;
             __asm__ volatile("adr %0, send_output\n orr %0,%0,#1" : "=r"(send));
-            ram_api api = {1, (void *)send, &failed};
+            __asm__ volatile("adr %0, recv_input\n orr %0,%0,#1" : "=r"(recv));
+            ram_api api = {2, (void *)send, &failed, (void *)recv};
             boot_ram_call call = {((uintptr_t)code + header.entry) | 1u, &api,
                                   header.arg0, header.arg1, 0};
             boot_ram_sync(code, header.length);

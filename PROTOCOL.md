@@ -124,7 +124,7 @@ prevent it.
 
 After a claim, there is no session timeout or automatic release.
 The loader accepts CONTINUE in the command loop and in the release loop after
-a failure. CONTINUE cannot interrupt a program. During LOAD or an OUTPUT_ACK
+a failure. CONTINUE cannot interrupt a program. During LOAD or an OUTPUT_ACK/INPUT_DATA
 wait, CONTINUE causes a failure because the loader expects a different packet.
 This CONTINUE packet does not clear the hold. Send another CONTINUE when the
 loader reaches the release loop. If a program does not return, the loader may
@@ -145,11 +145,15 @@ The request operation is byte 8. Its payload starts at byte 9.
 | DATA | 2 | 9: count `u8`; 10: count data bytes; remaining bytes through 30: zero |
 | RUN | 3 | All zero |
 | OUTPUT_ACK | 4 | All zero |
+| INPUT_DATA | 5 | 9: count `u8`, 0–16; 10–25: data padded to 16 bytes; 26: data CRC32 `u32`; 30: zero |
 
 The program length must be an even number from **2 to 512 bytes**.
 The entry offset must be even and less than the program length. The loader
 sets the Thumb bit. Each DATA packet contains **1–16 bytes**. The count must
 not exceed the remaining image length.
+
+INPUT_DATA carries the same CRC-32 variant used by LOAD, calculated over the
+counted data bytes only. Count 0 signals end-of-stream and has CRC32 0.
 
 DATA has no offset field. The loader appends each block to the bytes already
 received. Use one channel that preserves packet order. Wait for each reply
@@ -164,6 +168,7 @@ The reply kind and status are bytes 12 and 13. Reply data starts at byte 14.
 | RESULT | 2 | 0, or IO_ERROR (5) | Program return value `u32` at 14; remaining bytes zero |
 | READY | 3 | 0 | Zero; the complete image passed the CRC check and is available |
 | ERROR | 4 | Error code below | Zero |
+| INPUT | 5 | Capacity, 1–16 | Zero; the program is waiting for input |
 
 | Error code | Value | Meaning |
 |---|---|---|
@@ -190,8 +195,9 @@ the loader rejects the new LOAD fields. A successful exchange has this sequence:
 LOAD                 → ACK
 DATA (not last)       → ACK       [repeat as necessary]
 DATA (last)           → READY     [after the image CRC check]
-RUN                  → OUTPUT or RESULT
-OUTPUT_ACK           → OUTPUT or RESULT  [until RESULT]
+RUN                  → OUTPUT, INPUT, or RESULT
+OUTPUT_ACK           → OUTPUT, INPUT, or RESULT
+INPUT_DATA           → OUTPUT, INPUT, or RESULT  [until RESULT]
 CONTINUE (CONT)       → RLSD
 ```
 
@@ -199,13 +205,13 @@ RUN makes the program unavailable before it calls the entry point.
 Upload the complete program again before another execution. The last DATA
 packet produces READY without an additional ACK. A nonzero program return
 value is application data. It is not a protocol error if RESULT status is zero.
-OUTPUT_ACK outside the callback exchange produces BAD_REQUEST.
+OUTPUT_ACK or INPUT_DATA outside its callback exchange produces BAD_REQUEST.
 
 After BAD_REQUEST, BAD_CRC, or UNAVAILABLE, the loader can still accept commands.
 However, the reference host marks the session as failed after any ERROR reply.
 After a timeout, invalid reply, unexpected reply, or disconnection, stop loader
 commands. Do not retry a request or reconnect to continue the session.
-Do not repeat RUN or OUTPUT_ACK. The protocol cannot detect duplicate requests.
+Do not repeat RUN, OUTPUT_ACK, or INPUT_DATA. The protocol cannot detect duplicate requests.
 If the RUN result is unknown, the program may already have run.
 Send CONTINUE to release boot. Before another attempt, start a new boot and
 claim it again.
@@ -216,14 +222,30 @@ Use Thumb position-independent code. The program must return normally.
 
 ```c
 typedef struct {
-    uint32_t version;  /* 1 */
+    uint32_t version;  /* 2 */
     int (*send)(void *context, const void *data, uint32_t size);
     void *context;
+    int (*recv)(void *context, void *data, uint32_t size);
 } ram_api;
 
 uint32_t entry(const ram_api *api, uint32_t arg0, uint32_t arg1);
 /* send(api->context, bytes, count): 0 success, -1 failure */
 ```
+
+API version 2 appends `recv` after the version-1 fields. Programs using only
+that prefix can still run. A program that needs `recv` must check `version >= 2`
+before accessing it.
+
+`recv` requests one chunk with capacity `min(size, 16)`, then waits for
+INPUT_DATA. It returns the number of bytes copied, 0 for end-of-stream, or -1
+on failure. A zero-size call returns 0 without a packet. The count must not
+exceed the advertised capacity, and the data CRC32 must match before any bytes
+are copied. A receive failure latches the same IO_ERROR state as a send failure.
+
+`boot.py --input FILE` supplies file bytes to `recv`. Without an input file,
+the host responds with end-of-stream. Python callers can pass a
+`source(capacity) -> bytes` callable to `Client.execute`. Programs can alternate
+input and output; each callback still uses one request/reply exchange at a time.
 
 The program runs synchronously in the protocol worker. The `send` callback
 splits data into OUTPUT replies with a maximum of 16 bytes each. It waits for
@@ -260,7 +282,7 @@ lines and invalidates the instruction cache.
 ## Time limits
 
 The normal command wait has no timeout. After a frame starts, reception fails
-if no new byte arrives for 128 ticks (125 ms). Each DATA or OUTPUT_ACK wait has
+if no new byte arrives for 128 ticks (125 ms). Each DATA, INPUT_DATA, or OUTPUT_ACK wait has
 an overall timeout of 2048 ticks (2 s).
 
 Each temple transmission uses a local polling timeout of 21 ticks
@@ -271,6 +293,59 @@ These time limits require the scheduler and tick counter to continue to run.
 They give no independent hardware-watchdog guarantee. There is no execution
 timeout. Recovery from a faulty program or a program that does not return is
 not guaranteed.
+
+## Uploaded MRAM recovery writer
+
+[recover.py](tools/recover.py) uses LOAD and RUN to upload
+[recover.c](src/examples/recover.c). The writer requires RAM API version 2.
+`arg0` is the MRAM destination and `arg1` is the byte count; both must be
+multiples of 16. A zero-length call checks API support without programming.
+The host performs this check before backing up or writing the target range.
+
+The writer stays resident while `recv` supplies framed input chunks. It fills
+a 256-byte RAM buffer, programs and compares that block, then reports a
+little-endian cumulative byte count through `send`. Early EOF or any callback
+failure stops programming. Raw mode uploads the writer once for the entire
+range. Application mode streams the body in one invocation and uses a separate
+short invocation for the vector commit after checking the body CRC.
+
+The writer accepts physical MRAM addresses in `[0x00400000, 0x00800000)`.
+An active stock OTA flag does not block programming. It calls the stock 2.3.2.14 MRAM routine
+at Thumb address `0x0042E83D` with the programming key, source, destination,
+and word count. The host checks the stock bootloader SHA-256 before using this
+binding, with the known hook restored in its copy of the bytes.
+
+The stock routine saves interrupt state, enables ROM access, calls the ROM
+programming service, cleans up, and restores interrupt state. The uploaded
+writer invalidates the programmed destination's CPU data-cache lines, then
+compares the destination with the source before reporting progress. Return 0
+means success; 1 means invalid bounds/alignment; 3 means a readback mismatch;
+4 means RAM API version 2 is required; and 5 means incomplete input or callback
+failure. Stock programming errors are returned unchanged.
+
+The host backs up the affected range and checks its CRC before writing. It
+writes the application body first, checks its CRC, then writes the first 16
+vector-table bytes and checks the full CRC. It preserves alignment padding
+from the backup. Only successful verification permits CONTINUE. Neither this
+ordering nor the backup makes the update atomic. A failed or interrupted write
+can leave an incomplete main application. In default application mode, writes
+remain within `[0x00438000, 0x007FE000)`.
+
+With `--address`, the same tool writes raw bytes to the selected MRAM address.
+Writes whose aligned range extends outside `[0x00438000, 0x007FE000)`
+require `--i-verified-the-addresses`. This mode preserves
+neighboring bytes in the first and last 16-byte units and writes in address
+order, without vector-table checks. It can write the pending OTA flag,
+bootloader, or settings. Overwriting resident services used by the current
+session can stop it before verification or CONTINUE. Hardware programming
+permissions still apply. `--hold`
+omits CONTINUE after successful verification; an uncleared pending OTA flag
+can cause the stock updater to run when boot is released.
+
+Tests execute the writer and the pinned stock MRAM wrapper with modeled ROM
+programming and power controls. Right-temple hardware tests also cover streamed
+input, input CRC rejection, and programming, readback, and restoration of an
+unused 1 KiB MRAM range. Full application replacement is not hardware-tested.
 
 ## Optional case USB relay
 

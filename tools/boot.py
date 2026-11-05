@@ -6,6 +6,7 @@ Requires the patched bootloader. The ordinary case MCU firmware is unchanged.
 """
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -14,6 +15,11 @@ def main():
     p.add_argument("program", type=Path)
     p.add_argument("--port", required=True)
     p.add_argument("--side", choices=("left", "right"), default="right")
+    p.add_argument(
+        "--input",
+        type=Path,
+        help="file supplied to the program through recv (RAM API 2)",
+    )
     p.add_argument("--entry", type=lambda x: int(x, 0), default=0)
     p.add_argument("--arg0", type=lambda x: int(x, 0), default=0)
     p.add_argument("--arg1", type=lambda x: int(x, 0), default=0)
@@ -32,9 +38,18 @@ def main():
         p.error("arguments must fit uint32")
     from g2patch.link import run
 
-    result, data, _out = run(
-        a.port, code, a.entry, a.arg0, a.arg1, output=a.output, side=a.side
-    )
+    with ExitStack() as files:
+        source = files.enter_context(a.input.open("rb")).read if a.input else None
+        result, data, _out = run(
+            a.port,
+            code,
+            a.entry,
+            a.arg0,
+            a.arg1,
+            output=a.output,
+            side=a.side,
+            source=source,
+        )
     print(f"Result: {result:#010x}; callback: {data.hex()}; boot continued")
 
 

@@ -8,8 +8,8 @@ The authenticated hold and plain continue exchange is in handshake.py.
 import struct
 import zlib
 
-LOAD, DATA, RUN, OUTPUT_ACK = 1, 2, 3, 4
-ACK, OUTPUT, RESULT, READY, ERROR = 0, 1, 2, 3, 4
+LOAD, DATA, RUN, OUTPUT_ACK, INPUT_DATA = 1, 2, 3, 4, 5
+ACK, OUTPUT, RESULT, READY, ERROR, INPUT = 0, 1, 2, 3, 4, 5
 
 
 def request(operation, payload=b""):
@@ -46,7 +46,7 @@ def decode_reply(frame):
     if frame[-1] != ((25 + sum(frame[4:-1])) & 255):
         raise ValueError("reply checksum failed")
     kind, status = frame[12:14]
-    if kind > ERROR or (kind == OUTPUT and not 1 <= status <= 16):
+    if kind > INPUT or (kind in (OUTPUT, INPUT) and not 1 <= status <= 16):
         raise ValueError("invalid reply kind or count")
     if kind in (ACK, READY) and status:
         raise ValueError("invalid acknowledgement status")
@@ -109,15 +109,31 @@ class Client:
                 READY if offset + len(chunk) == len(code) else ACK,
             )
 
-    def execute(self, callback=None):
+    def execute(self, callback=None, source=None):
         output = bytearray()
         try:
             kind, _status, data = self._exchange(request(RUN))
-            while kind == OUTPUT:
-                output.extend(data)
-                if callback:
-                    callback(data)
-                kind, _status, data = self._exchange(request(OUTPUT_ACK))
+            while kind in (OUTPUT, INPUT):
+                if kind == OUTPUT:
+                    output.extend(data)
+                    if callback:
+                        callback(data)
+                    packet = request(OUTPUT_ACK)
+                else:
+                    chunk = source(_status) if source else b""
+                    if (
+                        not isinstance(chunk, (bytes, bytearray, memoryview))
+                        or len(chunk) > _status
+                    ):
+                        raise ValueError(
+                            "input source exceeded the requested chunk size"
+                        )
+                    chunk = bytes(chunk)
+                    packet = request(
+                        INPUT_DATA,
+                        struct.pack("<B16sI", len(chunk), chunk, zlib.crc32(chunk)),
+                    )
+                kind, _status, data = self._exchange(packet)
             if kind != RESULT:
                 raise ValueError("RUN did not produce a result")
             return struct.unpack_from("<I", data)[0], bytes(output)

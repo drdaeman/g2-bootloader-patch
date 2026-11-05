@@ -11,7 +11,7 @@ The case program runs in RAM; case flash does not change.
 Only the stock **2.3.2.14 bootloader** is supported. The patch tool checks its
 SHA-256 before it changes any bytes. The case relay requires **case 1.2.57**.
 
-The current patch passed emulator tests and hardware tests on both temples
+The UART2 loader passed emulator tests and hardware tests on both temples
 with **hardware 5** and **main application 2.4.0.24**.
 
 ## Introduction
@@ -168,6 +168,36 @@ normally. They run synchronously with privileged access and no isolation or
 execution timeout. CONTINUE cannot interrupt a program. Recovery from a faulty
 program is not guaranteed. See [PROTOCOL.md](PROTOCOL.md) for the ABI, packet
 format, and failure handling.
+
+## Main application recovery
+
+To recover a broken main application through the bootloader, use `tools/recover.py`.
+It accepts an EVENOTA bundle or a raw application image starting at its vector table.
+It writes to the MRAM directly, without using the normal OTA path through littlefs
+on the NOR flash. It does not install external-flash resources from the bundle.
+
+Streaming recovery requires the bootloader with RAM API version 2 (`recv`).
+Upload the writer once to stream a whole range; application recovery uses a
+separate short invocation to commit the vectors after checking the body CRC.
+The tool checks API support before starting the backup or writes.
+
+The receive callback and recovery writer passed right-temple hardware tests,
+including streamed input, CRC rejection, and programming, readback, and
+restoration of an unused 1 KiB MRAM range. Full application replacement has not
+been hardware-tested.
+
+To verify the firmware file and print information without writing:
+
+```sh
+make
+python3 tools/recover.py firmware.bin
+```
+
+To write through the USB-connected case:
+
+```sh
+python3 tools/recover.py firmware.bin --write "$CASE_PORT" --side right
+```
 
 ## Security
 
