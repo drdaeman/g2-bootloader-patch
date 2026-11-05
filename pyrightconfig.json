@@ -1,0 +1,6 @@
+{
+  "typeCheckingMode": "standard",
+  "include": ["tools", "tests"],
+  "exclude": ["build"],
+  "extraPaths": ["tools"]
+}

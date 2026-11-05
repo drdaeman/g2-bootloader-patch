@@ -1,0 +1,320 @@
+# UART2 bootloader RAM protocol
+
+*NOTE:* This is an LLM-generated document, reviewed by a human.
+
+The [loader](src/bootloader.c) lets the host stop boot, upload a small RAM
+program, and run it. The host must send CONTINUE to release boot. The protocol
+has no commands to write firmware images or files.
+
+The supported target uses these versions:
+
+- Bootloader: **2.3.2.14**
+- Main application: **2.4.0.24**
+- Hardware: **5**
+- Case: **1.2.57**
+
+Use the bootloader and host tools from the same source version.
+Select the target temple with `boot.py --side left|right` or
+`flash.py --side left|right --verify-port PORT`. The case uses the same stock
+reset waveform for each temple.
+
+[flash.py](tools/flash.py) installs the patch through stock BLE authentication
+and OTA. It does not require Faceclaw patches or an HMAC diagnostic endpoint.
+The optional `--verify-port` argument selects a case serial port for
+verification. This check uploads and runs [checksum.c](src/examples/checksum.c)
+to read the bootloader CRC through the RAM ABI below. It adds no protocol
+commands. Verification requires the `make all` build files. The tool checks
+these files before OTA starts.
+
+## Packet format
+
+All offsets start at zero. Integer fields are unsigned and little-endian.
+Checksums are byte sums modulo 256. ASCII markers are literal bytes.
+The protocol has no escaping, sequence numbers, or retransmission.
+HOLD and OKAY use HMAC. Later commands and replies have no MAC.
+
+HELO contains the protocol version as a little-endian `uint32_t` at bytes 12–15.
+The current version is **`0x00000001`**, sent as `01 00 00 00`.
+Reject an unsupported version before sending HOLD. Its challenge starts at byte 16.
+No other packet contains the challenge.
+
+The current implementation does not use a random number generator. The handshake
+challenge is `tick XOR 0x32524c47`, where `tick` is the boot tick count. It can
+repeat after a reboot, so a captured handshake can be replayed when the challenge
+repeats, even with a private HMAC key. Hardware RNG support is not implemented.
+
+| Direction | Layout | Checksum |
+|---|---|---|
+| Host/case → temple, 25 bytes (HOLD) | `7E 00 01 14`, `HOLD`, tag[16], sum[1] | `25 + 0x7D + sum(bytes[0:24])` |
+| Host/case → temple, 9 bytes (CONT) | `7E 00 01 04`, `CONT`, sum[1] | `9 + 0x7D + sum(bytes[0:8])` |
+| Temple → host/case, 21 bytes (HELO) | `5A A5 FF 10 00 01 03 0C`, `HELO`, version[4], challenge[4], sum[1] | `14 + sum(bytes[4:20])` |
+| Temple → host/case, 29 bytes (OKAY) | `5A A5 FF 18 00 01 03 14`, `OKAY`, tag[16], sum[1] | `22 + sum(bytes[4:28])` |
+| Temple → host/case, 13 bytes (RLSD) | `5A A5 FF 08 00 01 03 04`, `RLSD`, sum[1] | `6 + sum(bytes[4:12])` |
+| Host/case → temple, 32 bytes | `7E 00 01 1B`, `RQST`, operation[1], payload[22], sum[1] | `32 + 0x7D + sum(bytes[0:31])` |
+| Temple → host/case, 32 bytes | `5A A5 FF 1B 00 01 03 17`, `RESP`, kind[1], status[1], data[16], reserved[1], sum[1] | `25 + sum(bytes[4:31])` |
+
+In `bytes[a:b]`, the range includes byte `a` and excludes byte `b`.
+Set unused payload bytes to zero. Replies contain zeros in unused data bytes
+and reserved byte 30. Before the next request, check the full fixed prefix,
+length, checksum, expected reply kind, and applicable status.
+Loader commands and replies contain no nonce or sequence number.
+
+The reference implementations are
+[handshake.py](tools/g2patch/handshake.py) and
+[protocol.py](tools/g2patch/protocol.py).
+
+## Handshake key and tags
+
+The key is the UTF-8 value of `G2_BOOT_KEY`. If this variable is absent, the key
+is `DEFAULTNOTSECRET`. An empty value is not allowed. Set the same value when
+you build the images and run the host tools. Run `make` after a key change.
+The build generates `build/auth_key.h` and embeds the key in the temple image.
+The host computes HOLD and verifies OKAY. The case relay contains no key.
+
+The default key is public. It does not restrict access. A private override is
+also present in the compiled temple image; this scheme does not protect it from
+someone who can read those images.
+
+HOLD and OKAY each contain the first 16 bytes of HMAC-SHA-256 over this input:
+
+| Offset | Bytes | Value |
+|---|---|---|
+| 0 | 6 | ASCII `G2BOOT` |
+| 6 | 4 | Protocol version, little-endian |
+| 10 | 4 | HELO challenge, little-endian |
+| 14 | 4 | ASCII `HOLD` or `OKAY`, matching the packet |
+
+The different markers give each direction a different tag. Check the full tag
+before accepting the packet. Headers and byte checksums are checked separately.
+See [auth.h](src/auth.h) and [auth.py](tools/g2patch/auth.py).
+
+A successful handshake does not authenticate later traffic. CONT, RLSD, RQST,
+and RESP contain neither a challenge nor an HMAC tag. RUN is not idempotent;
+its no-retry rule still applies.
+
+## Claim and release
+
+A claim keeps boot on hold until the host sends CONTINUE.
+
+| Order | Direction | Marker | Meaning |
+|---|---|---|---|
+| 1 | Temple → host | `HELO` | One boot beacon with the version and challenge |
+| 2 | Host → temple | `HOLD` | Claim with the HOLD HMAC tag |
+| 3 | Temple → host | `OKAY` | Claim acknowledgment with the OKAY HMAC tag |
+| 4 | Host → temple | `CONT` | CONTINUE |
+| 5 | Temple → host | `RLSD` | Release acknowledgment |
+
+Verify OKAY with the HELO challenge and key before you send loader commands. The loader sets the hold
+before it transmits OKAY. If this transmission fails, boot stays on hold and
+the loader accepts only CONTINUE.
+
+On CONTINUE, the loader tries to transmit RLSD. It then clears the hold, even
+if the transmission fails. RLSD confirms release. Check separately that the
+main application starts.
+
+The worker sends the beacon without an initial delay. After worker creation,
+the manager waits **512 ticks (500 ms at 1024 Hz)** before it checks the hold.
+The worker has no separate receive deadline. The manager has higher priority
+than the worker. Send HOLD within this window.
+
+Without a claim, the manager removes the worker, returns UART control to the
+stock code, and continues boot. Active UART2 ownership or incompatible
+initialization can prevent the probe. Shared UART power status alone does not
+prevent it.
+
+After a claim, there is no session timeout or automatic release.
+The loader accepts CONTINUE in the command loop and in the release loop after
+a failure. CONTINUE cannot interrupt a program. During LOAD or an OUTPUT_ACK
+wait, CONTINUE causes a failure because the loader expects a different packet.
+This CONTINUE packet does not clear the hold. Send another CONTINUE when the
+loader reaches the release loop. If a program does not return, the loader may
+never process CONTINUE.
+
+The host release procedure permits up to three CONTINUE exchanges before it
+requires RLSD. These exchanges can receive a pending reply and stop an active
+transaction. The host sends the next CONTINUE only after a valid reply.
+It does not retry transport failures or repeat RUN.
+
+## Loader requests and replies
+
+The request operation is byte 8. Its payload starts at byte 9.
+
+| Operation | Value | Payload fields at absolute byte offsets |
+|---|---|---|
+| LOAD | 1 | 9: length `u16`; 11: entry offset `u16`; 13: arg0 `u32`; 17: arg1 `u32`; 21: image CRC32 `u32`; 25–30: zero |
+| DATA | 2 | 9: count `u8`; 10: count data bytes; remaining bytes through 30: zero |
+| RUN | 3 | All zero |
+| OUTPUT_ACK | 4 | All zero |
+
+The program length must be an even number from **2 to 512 bytes**.
+The entry offset must be even and less than the program length. The loader
+sets the Thumb bit. Each DATA packet contains **1–16 bytes**. The count must
+not exceed the remaining image length.
+
+DATA has no offset field. The loader appends each block to the bytes already
+received. Use one channel that preserves packet order. Wait for each reply
+before you send the next request.
+
+The reply kind and status are bytes 12 and 13. Reply data starts at byte 14.
+
+| Kind | Value | Status | Data |
+|---|---|---|---|
+| ACK | 0 | 0 | Zero; LOAD or a DATA packet before the last packet was accepted |
+| OUTPUT | 1 | Byte count, 1–16 | The specified number of callback bytes |
+| RESULT | 2 | 0, or IO_ERROR (5) | Program return value `u32` at 14; remaining bytes zero |
+| READY | 3 | 0 | Zero; the complete image passed the CRC check and is available |
+| ERROR | 4 | Error code below | Zero |
+
+| Error code | Value | Meaning |
+|---|---|---|
+| UNAVAILABLE | 1 | RUN has no available program |
+| BAD_REQUEST | 2 | Invalid LOAD fields, DATA count, or command in the command loop |
+| BAD_CRC | 3 | The CRC of the uploaded image does not match the supplied CRC |
+| ABORTED | 4 | Receive, protocol, or transport failure; the loader now accepts only CONTINUE |
+| IO_ERROR | 5 | Callback transmission or acknowledgment failed; RESULT reports this error if the program returns |
+
+The image uses reflected CRC-32/ISO-HDLC:
+
+- Polynomial: `0xEDB88320`
+- Initial state: `0xFFFFFFFF`
+- Final XOR: `0xFFFFFFFF`
+- Python equivalent: `zlib.crc32(image)`
+
+The CRC covers exactly `length` uploaded bytes, including program padding.
+It excludes request headers and unused packet bytes.
+
+Every LOAD first makes the previous program unavailable. This also occurs if
+the loader rejects the new LOAD fields. A successful exchange has this sequence:
+
+```text
+LOAD                 → ACK
+DATA (not last)       → ACK       [repeat as necessary]
+DATA (last)           → READY     [after the image CRC check]
+RUN                  → OUTPUT or RESULT
+OUTPUT_ACK           → OUTPUT or RESULT  [until RESULT]
+CONTINUE (CONT)       → RLSD
+```
+
+RUN makes the program unavailable before it calls the entry point.
+Upload the complete program again before another execution. The last DATA
+packet produces READY without an additional ACK. A nonzero program return
+value is application data. It is not a protocol error if RESULT status is zero.
+OUTPUT_ACK outside the callback exchange produces BAD_REQUEST.
+
+After BAD_REQUEST, BAD_CRC, or UNAVAILABLE, the loader can still accept commands.
+However, the reference host marks the session as failed after any ERROR reply.
+After a timeout, invalid reply, unexpected reply, or disconnection, stop loader
+commands. Do not retry a request or reconnect to continue the session.
+Do not repeat RUN or OUTPUT_ACK. The protocol cannot detect duplicate requests.
+If the RUN result is unknown, the program may already have run.
+Send CONTINUE to release boot. Before another attempt, start a new boot and
+claim it again.
+
+## Execution ABI
+
+Use Thumb position-independent code. The program must return normally.
+
+```c
+typedef struct {
+    uint32_t version;  /* 1 */
+    int (*send)(void *context, const void *data, uint32_t size);
+    void *context;
+} ram_api;
+
+uint32_t entry(const ram_api *api, uint32_t arg0, uint32_t arg1);
+/* send(api->context, bytes, count): 0 success, -1 failure */
+```
+
+The program runs synchronously in the protocol worker. The `send` callback
+splits data into OUTPUT replies with a maximum of 16 bytes each. It waits for
+OUTPUT_ACK after each reply. If no previous send failed, a zero-size send
+succeeds without a packet.
+
+After the first send failure, all further sends return -1. If the program
+returns, the loader reports RESULT with status IO_ERROR. It then accepts only
+CONTINUE.
+
+The API and context are valid only for the current call to the program.
+Keep output data valid until `send` returns. Do not retain the API or context
+pointers. Do not schedule asynchronous callback calls. Do not leave tasks
+that execute code from the upload buffer. See [ram_api.h](src/ram_api.h) and the
+[callback example](src/examples/echo.c).
+
+The trampoline saves and restores these registers around the call:
+
+- r0–r12 and LR
+- APSR flags, PRIMASK, BASEPRI, FAULTMASK, and CONTROL
+- FPSCR, VPR, and s0–s31
+- PSPLIM and MSPLIM
+
+The program must keep a valid stack and return context. The trampoline does
+not isolate the program. It does not reverse changes to RAM, peripherals,
+interrupt-controller state, or tasks. Other effects of privileged code also
+remain.
+
+On first use with inactive FP context (`CONTROL.FPCA=0`), VMRS can initialize
+FPSCR from FPDSCR. The trampoline restores the context saved after that
+initialization. Before execution, the loader cleans the uploaded data-cache
+lines and invalidates the instruction cache.
+
+## Time limits
+
+The normal command wait has no timeout. After a frame starts, reception fails
+if no new byte arrives for 128 ticks (125 ms). Each DATA or OUTPUT_ACK wait has
+an overall timeout of 2048 ticks (2 s).
+
+Each temple transmission uses a local polling timeout of 21 ticks
+(approximately 20.5 ms). Loader replies, OKAY, and RLSD also have a 6-tick delay
+before transmission to allow the direction to change.
+
+These time limits require the scheduler and tick counter to continue to run.
+They give no independent hardware-watchdog guarantee. There is no execution
+timeout. Recovery from a faulty program or a program that does not return is
+not guaranteed.
+
+## Optional case USB relay
+
+The case relay puts each temple packet inside a separate packet.
+[boot.py](tools/boot.py) uses [link.py](tools/g2patch/link.py) to load
+[case_reset_loader.c](src/case/case_reset_loader.c) into RAM. One case program
+performs the reset, claim, and relay operations. Case flash does not change.
+
+After the bridge setup in `link.py`, the case sends this startup data:
+
+```text
+16 bytes: four little-endian UART register values
+11 bytes: "G2U2_ARMED\n"
+21 bytes: HELO beacon
+12 bytes: "G2RAM_READY\n"
+```
+
+The case resets the temple and forwards HELO. Wait for G2RAM_READY, validate
+HELO, and compute HOLD on the host. Allow 30 ms after HELO for the temple to
+switch to receive mode. Send HOLD through G2TX and verify the returned OKAY
+on the host. Complete this exchange within the temple's 500 ms boot window.
+
+| Direction | Packet |
+|---|---|
+| Host → case | `G2TX`, length `u8`, temple packet[length], checksum `u8` |
+| Case → host | `G2RX`, status `u8`, length `u8`, temple packet[length], checksum `u8` |
+| Host → case | `G2EX` (four bytes, no checksum; exits the relay) |
+
+Each outer checksum is the sum of all preceding bytes in that packet,
+modulo 256. G2TX length is 9, 25, or 32. Use length 0 to receive without a
+transmission to the temple. G2RX length is 13, 21, 29, or 32 after a successful receive.
+Otherwise, it is 0.
+
+| Relay status | Meaning |
+|---|---|
+| 0 | Transport success |
+| 1 | The case did not transmit all bytes to the temple |
+| 2 | Receive failure |
+
+Status 0 does not confirm the inner checksum or packet contents. The host must
+check the temple packet. An invalid host packet format or checksum stops the
+relay without a G2RX error packet. Each G2TX produces a maximum of one G2RX.
+The callback waits for OUTPUT_ACK before it sends more output.
+
+G2EX does not send CONTINUE. Release the temple before you stop the relay.
+Keep the same case program running throughout the exchange. A case reset or
+ROM transition to load a different bridge can lose the held temple session.

@@ -1,0 +1,11 @@
+/build/
+/result
+
+/__pycache__/
+**/__pycache__/
+*.py[cod]
+.ruff_cache
+
+/.direnv/
+/.local/
+/.env*
