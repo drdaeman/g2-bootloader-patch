@@ -199,6 +199,40 @@ To write through the USB-connected case:
 python3 tools/recover.py firmware.bin --write "$CASE_PORT" --side right
 ```
 
+## Boot an alternate image once
+
+For custom firmware testing, the patched bootloader can be told to boot any
+image from a custom address once. The intended use case is that if you have
+a small test image, you can flash it in a free region of MRAM or even upload
+to ITCM, and test it without affecting the main application. The idea is that
+you can reboot the glasses to recover.
+
+Uploaded image must be correctly linked to run from its intended address.
+
+To write an image starting at 0x7C0000 (be careful deciding where to upload,
+check your glasses' firmware size first) and boot it once in the same session:
+
+```sh
+python3 tools/recover.py custom.bin --address 0x7C0000 --boot \
+  --write "$CASE_PORT" --side right
+```
+
+To boot an image that is already installed and needs no upload:
+
+```sh
+python3 tools/altboot.py 0x7C0000 --port "$CASE_PORT" --side right
+```
+
+For some tests, you may want to skip MRAM entirely. Load the image into ITCM,
+at a 4 KiB-aligned address from `0x1000` to below `0x40000`, and boot it from
+there. ITCM is volatile, so if something goes wrong, a power cycle brings
+glasses back to the stock application:
+
+```sh
+python3 tools/altboot.py 0x1000 --load custom-itcm.bin \
+  --port "$CASE_PORT" --side right
+```
+
 ## Security
 
 Bootloader access is secured with a HMAC-SHA256 challenge-response mechanism,

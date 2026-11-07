@@ -17,6 +17,8 @@ enum {
     STOCK_UART_WAKE_ENTRY = 0x0041f847u,
     STOCK_UART_SLEEP_ENTRY = 0x0041f8bbu,
     STOCK_UPDATE_FLAG_ENTRY = 0x0042e56du,
+    /* Sets VTOR, loads MSP from the table and branches to its reset vector. */
+    STOCK_VECTOR_HANDOFF_ENTRY = 0x0042dfd9u,
 
     BOOT_UART2_HANDLE_SLOT = 0x20000494u,
     BOOT_UART2_PIN_TABLE_SLOT = 0x20000498u,
@@ -25,6 +27,16 @@ enum {
     BOOT_UART2_EXPECTED_PIN_TABLE = 0x00434210u,
     BOOT_POWER_PRE_CALLBACK_SLOT = 0x20026e44u,
     BOOT_POWER_POST_CALLBACK_SLOT = 0x20026e48u,
+    /* Three words of DTCM below the stock MSPLIM (0x2007d000). The stock image's
+     * static RAM ends at 0x200271c8 and no stock literal addresses this gap. */
+    BOOT_SELECTION_SLOT = 0x2007cff0u,
+
+    MAIN_APPLICATION_BASE = 0x00438000u,
+    MAIN_APPLICATION_END = 0x007fe000u,
+    /* Stock init copies code to ITCM 0x40..0x6c and calls it until handoff. No
+     * other stock literal addresses ITCM, so boot images may use later pages. */
+    ITCM_BOOT_BASE = 0x00001000u,
+    ITCM_END = 0x00040000u,
 
     UART2_BASE = 0x4003b000u,
     UART2_DATA = UART2_BASE,
@@ -54,3 +66,5 @@ enum {
 #define NEW ((void *(*)(void (*)(void *), void *, const void *))STOCK_THREAD_NEW_ENTRY)
 #define DELETE ((void (*)(void *))STOCK_TASK_DELETE_ENTRY)
 #define ORIGINAL_FLAG ((uint32_t (*)(void))STOCK_UPDATE_FLAG_ENTRY)
+typedef void handoff_function(uint32_t vectors) __attribute__((noreturn));
+#define HANDOFF ((handoff_function *)STOCK_VECTOR_HANDOFF_ENTRY)

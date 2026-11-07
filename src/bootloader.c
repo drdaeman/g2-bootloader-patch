@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Stock 2.3.2.14 only. The manager owns UART setup/cleanup. A lower-priority
- * worker owns the wire protocol. Their only shared value is held.
+ * worker owns the wire protocol. They share one session: the worker publishes
+ * the selected boot target before it clears held.
  */
 /* Shared UART power-domain status is not UART2 ownership. */
 #define PROBE_WAIT_TICKS 512u
@@ -11,14 +12,18 @@
 #include "wire.h"
 #include "auth.h"
 #define IO_WAIT_TICKS 2048u
-enum { LOAD = 1, DATA, RUN, OUTPUT_ACK, INPUT_DATA };
+#define SELECTION_MAGIC 0x544f4231u /* "1BOT" */
+enum { LOAD = 1, DATA, RUN, OUTPUT_ACK, INPUT_DATA, BOOT };
 enum { ACK, OUTPUT, RESULT, READY, ERROR, INPUT };
-enum { UNAVAILABLE = 1, BAD_REQUEST, BAD_CRC, ABORTED, IO_ERROR };
+enum { UNAVAILABLE = 1, BAD_REQUEST, BAD_CRC, ABORTED, IO_ERROR, BAD_TARGET };
 
 typedef struct {
     uint16_t length, entry;
     uint32_t arg0, arg1;
 } program;
+typedef struct {
+    volatile uint32_t held, target;
+} session;
 typedef struct {
     const char *name;
     uint32_t bits;
@@ -48,6 +53,44 @@ static uint32_t crc32(const uint8_t *p, unsigned n) {
             c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
     }
     return ~c;
+}
+/* An alternate image must be 4 KiB-aligned inside the main-application MRAM
+ * region or ITCM above its first page, and start with a plausible vector table:
+ * an 8-byte-aligned SRAM stack pointer and a Thumb reset vector after the table
+ * base, inside the same region. */
+static int boot_target_valid(uint32_t vectors) {
+    uint32_t end;
+    if (vectors >= MAIN_APPLICATION_BASE && vectors < MAIN_APPLICATION_END)
+        end = MAIN_APPLICATION_END;
+    else if (vectors >= ITCM_BOOT_BASE && vectors < ITCM_END)
+        end = ITCM_END;
+    else
+        return 0;
+    if (vectors & 0xfffu)
+        return 0;
+    uint32_t sp = W(vectors), reset = W(vectors + 4u);
+    return !(sp & 7u) && sp > 0x20000000u && sp <= 0x20400000u && (reset & 1u) &&
+           (reset & ~1u) >= vectors + 8u && reset < end;
+}
+/* One-shot record from the manager's hook to the DFU task's handoff. */
+static void boot_select(uint32_t vectors) {
+    volatile uint32_t *record = (volatile uint32_t *)(uintptr_t)BOOT_SELECTION_SLOT;
+    record[0] = vectors ? SELECTION_MAGIC : 0;
+    record[1] = vectors;
+    record[2] = ~vectors;
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+/* Replaces both stock DFU-task calls of the handoff leaf, which always pass the
+ * stock main application. The selection is consumed before any jump, so it
+ * applies to one boot only; a missing or no longer valid target boots stock. */
+__attribute__((used, noinline, noreturn)) void boot_handoff(uint32_t vectors) {
+    volatile uint32_t *record = (volatile uint32_t *)(uintptr_t)BOOT_SELECTION_SLOT;
+    uint32_t target = record[1];
+    int armed = record[0] == SELECTION_MAGIC && record[2] == ~target;
+    boot_select(0);
+    if (armed && boot_target_valid(target))
+        vectors = target;
+    HANDOFF(vectors);
 }
 static void direction(unsigned tx) {
     const uint32_t *p = (const uint32_t *)(uintptr_t)W(BOOT_UART2_PIN_TABLE_SLOT);
@@ -259,32 +302,37 @@ static int is_continue(const uint8_t *p, unsigned got) {
             return 0;
     return 1;
 }
-static __attribute__((always_inline)) inline void
-finish_session(volatile uint32_t *held) {
+/* Every release publishes the boot target first; the manager reads it once
+ * held is clear. */
+static __attribute__((always_inline)) inline void finish_session(session *s,
+                                                                 uint32_t target) {
     uint8_t acknowledgement[13];
     announcement(acknowledgement, WIRE_RLSD, 0, 0);
     DELAY(6);
     (void)transmit(acknowledgement, sizeof(acknowledgement));
-    *held = 0;
+    s->target = target;
+    s->held = 0;
 }
-static __attribute__((always_inline)) inline void
-continue_only(volatile uint32_t *held) {
+static __attribute__((always_inline)) inline void continue_only(session *s) {
     uint8_t packet[32];
     for (;;) {
         unsigned got = receive(packet, 0);
         if (is_continue(packet, got))
             break;
     }
-    finish_session(held);
+    finish_session(s, 0);
 }
-static void commands(volatile uint32_t *held) {
+/* The boot selection stays local until a CONTINUE in this loop. Every failure
+ * path, including an unacknowledged BOOT, discards it. */
+static void commands(session *s) {
     uint8_t code[512] __attribute__((aligned(32))), p[32];
     program available;
     available.length = 0;
+    uint32_t selected = 0;
     for (;;) {
         unsigned got = receive(p, 0);
         if (is_continue(p, got)) {
-            finish_session(held);
+            finish_session(s, selected);
             return;
         }
         if (!got)
@@ -313,6 +361,18 @@ static void commands(volatile uint32_t *held) {
             put32(result, call.result);
             if (!reply(RESULT, failed ? IO_ERROR : 0, result, 4) || failed)
                 goto wait_continue;
+        } else if (command(p, got, BOOT)) {
+            /* Every BOOT first clears the selection; target 0 only clears it. */
+            uint32_t target = u32(p + 9);
+            selected = 0;
+            if (target && !boot_target_valid(target)) {
+                if (!reply(ERROR, BAD_TARGET, 0, 0))
+                    goto aborted;
+                continue;
+            }
+            if (!reply(ACK, 0, 0, 0))
+                goto aborted;
+            selected = target;
         } else if (!reply(ERROR, BAD_REQUEST, 0, 0))
             goto aborted;
     }
@@ -321,14 +381,14 @@ aborted:
     available.length = 0;
     (void)reply(ERROR, ABORTED, 0, 0);
 wait_continue:
-    continue_only(held);
+    continue_only(s);
 }
 __attribute__((used, noinline)) uint32_t boot_task_checkpoint(volatile uint32_t *held) {
     return *held;
 }
 __attribute__((used, noinline)) void boot_probe_wait(void) { DELAY(PROBE_WAIT_TICKS); }
 __attribute__((used, noinline)) static void uart2_worker(void *argument) {
-    volatile uint32_t *held = argument;
+    session *s = argument;
     uint32_t challenge = TICK ^ 0x32524c47u;
     uint8_t p[32],
         expected[25] = {0x7e,         0,           1, 20, WIRE_HOLD[0], WIRE_HOLD[1],
@@ -348,15 +408,15 @@ __attribute__((used, noinline)) static void uart2_worker(void *argument) {
         if (receive(p, 0) != sizeof(expected) ||
             !auth_equal(p, expected, sizeof(expected)))
             continue;
-        *held = 1;
+        s->held = 1;
         uint8_t tag[16];
         auth_tag(WIRE_OKAY, challenge, tag);
         announcement(p, WIRE_OKAY, tag, sizeof(tag));
         DELAY(6);
         if (transmit(p, 29))
-            commands(held);
+            commands(s);
         else
-            continue_only(held);
+            continue_only(s);
         break;
     }
 park:
@@ -365,7 +425,11 @@ park:
 }
 uint32_t boot_task_then_flag(void) {
     uint64_t stack[512], cb[14];
-    volatile uint32_t held = 0;
+    session s;
+    s.held = 0;
+    s.target = 0;
+    /* RAM can survive a reset; never inherit a previous boot's selection. */
+    boot_select(0);
     if (!W(BOOT_UART2_HANDLE_SLOT) ||
         W(BOOT_UART2_PIN_TABLE_SLOT) != BOOT_UART2_EXPECTED_PIN_TABLE ||
         (W(BOOT_UART2_AWAKE_SLOT) & 0xffu) || W(BOOT_UART2_RX_CALLBACK_SLOT) ||
@@ -388,11 +452,11 @@ uint32_t boot_task_then_flag(void) {
         a.reserved = 0;
         uintptr_t worker;
         __asm__ volatile("adr %0, uart2_worker\n orr %0,%0,#1" : "=r"(worker));
-        void *thread = NEW((void (*)(void *))worker, (void *)&held, &a);
+        void *thread = NEW((void (*)(void *))worker, (void *)&s, &a);
         if (thread) {
             boot_probe_wait();
-            if (boot_task_checkpoint(&held))
-                while (held)
+            if (boot_task_checkpoint(&s.held))
+                while (s.held)
                     DELAY(1);
             DELETE(thread);
         }
@@ -401,5 +465,10 @@ uint32_t boot_task_then_flag(void) {
     W(NVIC_IRQ0_CLEAR_PENDING) = UART2_IRQ_MASK;
     if (enabled)
         W(NVIC_IRQ0_SET_ENABLE) = UART2_IRQ_MASK;
-    return ORIGINAL_FLAG();
+    /* A pending stock update installs and boots the stock slot; it may also
+     * overwrite the selected image, so the selection is dropped. */
+    uint32_t pending = ORIGINAL_FLAG();
+    if (!pending && s.target)
+        boot_select(s.target);
+    return pending;
 }

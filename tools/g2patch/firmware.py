@@ -11,8 +11,14 @@ APP_BASE = 0x00438000
 PART_BYTES = APP_BASE - BASE
 STOCK_BYTES = 149760
 STOCK_SHA = "22a2b98e606b4d296e957a3a8b600a2158497638d79485c817c2025536329ba7"
-HOOK = 0x0042E656 - BASE
-OLD_CALL = bytes.fromhex("fff789ff")
+# (build artifact, partition offset, stock Thumb BL). The manager's update-flag
+# call, then the DFU task's two calls of the vector handoff leaf at 0x42DFD8.
+HOOKS = (
+    ("hook", 0x0042E656 - BASE, bytes.fromhex("fff789ff")),
+    ("hook_handoff_update", 0x0042E3D4 - BASE, bytes.fromhex("fff700fe")),
+    ("hook_handoff_boot", 0x0042E440 - BASE, bytes.fromhex("fff7cafd")),
+)
+HOOK, OLD_CALL = HOOKS[0][1:]
 PAGE_BYTES = 4096
 FILENAME = "ota/s200_bootloader.bin"
 # EvenOTA uses the Castagnoli polynomial without reflection or final XOR.
@@ -75,31 +81,44 @@ def extract_stock(data):
     )
 
 
+def restore_hooks(image):
+    """Copy of the stock-length prefix with every reviewed hook reverted."""
+    prefix = bytearray(image[:STOCK_BYTES])
+    for _name, offset, call in HOOKS:
+        prefix[offset : offset + 4] = call
+    return prefix
+
+
+def bl_target(offset, call):
+    first, second = struct.unpack("<HH", call)
+    if first & 0xF800 != 0xF000 or second & 0xD000 != 0xD000:
+        raise ValueError("hook is not a Thumb BL")
+    s = (first >> 10) & 1
+    delta = (
+        (s << 24)
+        | ((~((second >> 13) ^ s) & 1) << 23)
+        | ((~((second >> 11) ^ s) & 1) << 22)
+        | ((first & 1023) << 12)
+        | ((second & 2047) << 1)
+    )
+    if s:
+        delta -= 1 << 25
+    return offset + 4 + delta
+
+
 def validate_image(image):
     if not STOCK_BYTES <= len(image) <= PART_BYTES:
         raise ValueError("boot image exceeds its partition or is truncated")
-    prefix = bytearray(image[:STOCK_BYTES])
-    call = prefix[HOOK : HOOK + 4]
-    prefix[HOOK : HOOK + 4] = OLD_CALL
-    if sha(prefix) != STOCK_SHA:
-        raise ValueError("stock code/vectors changed outside the reviewed hook")
-    if call != OLD_CALL:
-        first, second = struct.unpack("<HH", call)
-        if first & 0xF800 != 0xF000 or second & 0xD000 != 0xD000:
-            raise ValueError("hook is not a Thumb BL")
-        s = (first >> 10) & 1
-        delta = (
-            (s << 24)
-            | ((~((second >> 13) ^ s) & 1) << 23)
-            | ((~((second >> 11) ^ s) & 1) << 22)
-            | ((first & 1023) << 12)
-            | ((second & 2047) << 1)
-        )
-        if s:
-            delta -= 1 << 25
-        target = HOOK + 4 + delta
-        if not STOCK_BYTES <= target < len(image):
-            raise ValueError("hook target lies outside appended code")
+    if sha(restore_hooks(image)) != STOCK_SHA:
+        raise ValueError("stock code/vectors changed outside the reviewed hooks")
+    patched = [image[offset : offset + 4] != call for _name, offset, call in HOOKS]
+    if any(patched) and not all(patched):
+        raise ValueError("only some of the reviewed hooks are installed")
+    for _name, offset, call in HOOKS:
+        if image[offset : offset + 4] != call:
+            target = bl_target(offset, image[offset : offset + 4])
+            if not STOCK_BYTES <= target < len(image):
+                raise ValueError("hook target lies outside appended code")
     return image + b"\xff" * ((-len(image)) % PAGE_BYTES)
 
 

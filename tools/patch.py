@@ -12,8 +12,7 @@ from g2patch.auth import key_id
 from g2patch.firmware import (
     APP_BASE,
     BASE,
-    HOOK,
-    OLD_CALL,
+    HOOKS,
     PAGE_BYTES,
     STOCK_BYTES,
     STOCK_SHA,
@@ -25,15 +24,22 @@ from g2patch.firmware import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def patch(stock, blob, hook):
+def load_hooks(build=ROOT / "build"):
+    return {name: (build / f"{name}.bin").read_bytes() for name, _, _ in HOOKS}
+
+
+def patch(stock, blob, hooks):
     if sha(stock[:STOCK_BYTES]) != STOCK_SHA:
         raise ValueError("stock bootloader identity mismatch")
-    if len(hook) != 4:
-        raise ValueError("hook must be one linked Thumb BL")
+    if set(hooks) != {name for name, _, _ in HOOKS}:
+        raise ValueError("expected exactly the reviewed hooks")
     image = bytearray(stock[:STOCK_BYTES])
-    if image[HOOK : HOOK + 4] != OLD_CALL:
-        raise ValueError("stock call mismatch")
-    image[HOOK : HOOK + 4] = hook
+    for name, offset, call in HOOKS:
+        if len(hooks[name]) != 4:
+            raise ValueError(f"{name} must be one linked Thumb BL")
+        if image[offset : offset + 4] != call:
+            raise ValueError("stock call mismatch")
+        image[offset : offset + 4] = hooks[name]
     image.extend(blob)
     image.extend(bytes(-len(image) % 4))
     raw_bytes = len(image)
@@ -94,9 +100,7 @@ def main():
     stock, offset = extract_stock(a.firmware.read_bytes())
     subprocess.run(["make", "-C", str(ROOT), "build/patch.bin"], check=True)
     image, raw_bytes = patch(
-        stock,
-        (ROOT / "build/patch.bin").read_bytes(),
-        (ROOT / "build/hook.bin").read_bytes(),
+        stock, (ROOT / "build/patch.bin").read_bytes(), load_hooks()
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(image)
@@ -104,7 +108,7 @@ def main():
         "stock_sha256": STOCK_SHA,
         "source_offset": offset,
         "base": BASE,
-        "hook": BASE + HOOK,
+        "hooks": {name: BASE + offset for name, offset, _ in HOOKS},
         "raw_bytes": raw_bytes,
         "raw_sha256": sha(image[:raw_bytes]),
         "bytes": len(image),

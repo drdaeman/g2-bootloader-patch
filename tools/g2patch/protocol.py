@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Sequential, non-retrying LOAD/RUN protocol for a held bootloader.
+"""Sequential, non-retrying LOAD/RUN/BOOT protocol for a held bootloader.
 
 One outstanding block, ordered channel, no reconnect/resume after ambiguity.
 The authenticated hold and plain continue exchange is in handshake.py.
@@ -8,8 +8,9 @@ The authenticated hold and plain continue exchange is in handshake.py.
 import struct
 import zlib
 
-LOAD, DATA, RUN, OUTPUT_ACK, INPUT_DATA = 1, 2, 3, 4, 5
+LOAD, DATA, RUN, OUTPUT_ACK, INPUT_DATA, BOOT = 1, 2, 3, 4, 5, 6
 ACK, OUTPUT, RESULT, READY, ERROR, INPUT = 0, 1, 2, 3, 4, 5
+UNAVAILABLE, BAD_REQUEST, BAD_CRC, ABORTED, IO_ERROR, BAD_TARGET = 1, 2, 3, 4, 5, 6
 
 
 def request(operation, payload=b""):
@@ -108,6 +109,15 @@ class Client:
                 request(DATA, bytes((len(chunk),)) + chunk),
                 READY if offset + len(chunk) == len(code) else ACK,
             )
+
+    def select_boot(self, address):
+        """Select a vector table for one boot after CONTINUE; 0 clears it.
+
+        Bootloaders without BOOT reply BAD_REQUEST; invalid targets BAD_TARGET.
+        """
+        if not 0 <= address <= 0xFFFFFFFF:
+            raise ValueError("boot address must fit uint32")
+        self._expect(request(BOOT, struct.pack("<I", address)), ACK)
 
     def execute(self, callback=None, source=None):
         output = bytearray()

@@ -3,7 +3,8 @@
 *NOTE:* This is an LLM-generated document, reviewed by a human.
 
 The [loader](src/bootloader.c) lets the host stop boot, upload a small RAM
-program, and run it. The host must send CONTINUE to release boot. The protocol
+program, and run it. It can also select an alternate main-application image for
+the current boot only. The host must send CONTINUE to release boot. The protocol
 has no commands to write firmware images or files.
 
 The supported target uses these versions:
@@ -146,6 +147,7 @@ The request operation is byte 8. Its payload starts at byte 9.
 | RUN | 3 | All zero |
 | OUTPUT_ACK | 4 | All zero |
 | INPUT_DATA | 5 | 9: count `u8`, 0–16; 10–25: data padded to 16 bytes; 26: data CRC32 `u32`; 30: zero |
+| BOOT | 6 | 9: vector table address `u32`, or 0 to clear; 13–30: zero |
 
 The program length must be an even number from **2 to 512 bytes**.
 The entry offset must be even and less than the program length. The loader
@@ -163,7 +165,7 @@ The reply kind and status are bytes 12 and 13. Reply data starts at byte 14.
 
 | Kind | Value | Status | Data |
 |---|---|---|---|
-| ACK | 0 | 0 | Zero; LOAD or a DATA packet before the last packet was accepted |
+| ACK | 0 | 0 | Zero; LOAD, BOOT, or a DATA packet before the last packet was accepted |
 | OUTPUT | 1 | Byte count, 1–16 | The specified number of callback bytes |
 | RESULT | 2 | 0, or IO_ERROR (5) | Program return value `u32` at 14; remaining bytes zero |
 | READY | 3 | 0 | Zero; the complete image passed the CRC check and is available |
@@ -177,6 +179,7 @@ The reply kind and status are bytes 12 and 13. Reply data starts at byte 14.
 | BAD_CRC | 3 | The CRC of the uploaded image does not match the supplied CRC |
 | ABORTED | 4 | Receive, protocol, or transport failure; the loader now accepts only CONTINUE |
 | IO_ERROR | 5 | Callback transmission or acknowledgment failed; RESULT reports this error if the program returns |
+| BAD_TARGET | 6 | BOOT names an address or vector table that the loader does not accept |
 
 The image uses reflected CRC-32/ISO-HDLC:
 
@@ -207,7 +210,7 @@ packet produces READY without an additional ACK. A nonzero program return
 value is application data. It is not a protocol error if RESULT status is zero.
 OUTPUT_ACK or INPUT_DATA outside its callback exchange produces BAD_REQUEST.
 
-After BAD_REQUEST, BAD_CRC, or UNAVAILABLE, the loader can still accept commands.
+After BAD_REQUEST, BAD_CRC, BAD_TARGET, or UNAVAILABLE, the loader can still accept commands.
 However, the reference host marks the session as failed after any ERROR reply.
 After a timeout, invalid reply, unexpected reply, or disconnection, stop loader
 commands. Do not retry a request or reconnect to continue the session.
@@ -215,6 +218,90 @@ Do not repeat RUN, OUTPUT_ACK, or INPUT_DATA. The protocol cannot detect duplica
 If the RUN result is unknown, the program may already have run.
 Send CONTINUE to release boot. Before another attempt, start a new boot and
 claim it again.
+
+## One-boot alternate image
+
+BOOT selects the vector table that the stock bootloader hands off to when
+it finishes this boot. Without a selection it uses the stock main application
+at `0x00438000`. The stock updater, its error handling, and its teardown run
+unchanged. Only the address passed to the stock handoff routine changes. That
+routine sets VTOR, loads MSP from the table, and branches to the reset vector.
+
+The loader accepts a target only if all of these conditions hold:
+
+- The address is a multiple of 4 KiB in one of these regions:
+  - MRAM `[0x00438000, 0x007FE000)`;
+  - ITCM `[0x00001000, 0x00040000)`.
+- The initial stack pointer is a multiple of 8 in `(0x20000000, 0x20400000]`.
+- The reset vector has the Thumb bit set. Its address is at least the table
+  address plus 8, and below the end of the same region.
+
+The first ITCM page is excluded because the stock bootloader copies code to
+`0x00000040–0x0000006C` at startup and calls it until the handoff. No other stock
+code literal points into ITCM, and the bootloader does not configure the MPU.
+
+Otherwise BOOT replies BAD_TARGET. Each BOOT first clears any earlier selection,
+so a rejected BOOT leaves none. Address 0 only clears it, and the last accepted
+BOOT wins. Earlier bootloader builds reply BAD_REQUEST to BOOT.
+
+The selection takes effect only through CONTINUE in the command loop. In each of
+these cases, the loader discards it and boot continues to the stock application:
+
+- the BOOT ACK cannot be transmitted;
+- any later abort or callback IO_ERROR.
+
+After the session, the manager discards the selection if the stock OTA flag is
+pending (`0x55555555` at `0x007FE000`). The updater may overwrite any part of the
+main-application region. Otherwise, the manager stores the selection in DTCM
+at `0x2007CFF0`, as three words: a marker, the address, and its complement.
+That address is just below the stock bootloader's MSP limit. The stock
+bootloader's static RAM ends at `0x200271C8`, and none of its code literals
+point into the gap. The manager clears the record at the start of every boot,
+before it checks for UART2 availability.
+
+Both stock handoff call sites (`0x0042E3D4` after an update, `0x0042E440` on a
+normal boot) call the patch instead. The patch reads and clears the record, then
+checks the target again with the rules above. If the record is valid and the
+target still passes, it hands off to the target. Otherwise it hands off to
+`0x00438000`. A reset of the temple therefore starts the stock application
+unless a new session selects the target again.
+
+The stock DFU task checks bit 29 of the stock application's initial stack
+pointer before it calls the handoff. A selection does not bypass that check.
+
+The record has a fixed marker and no secret, because the loader has no random
+number generator. Code that writes this DTCM slot between the boot-entry clear
+and the handoff can forge a selection. Code that runs in that window can already
+take control of the boot, so this adds no new access. The handoff still applies
+the target checks above, so a forged record can only start an image that passes
+them in the main-application MRAM region or in ITCM. A selection from an earlier boot
+cannot persist, because every boot clears the record before it reaches the
+handoff. MSP overflow cannot reach the slot: the stock MSP limit `0x2007D000`
+faults first. A memory-corruption bug in the stock bootloader or this patch
+during that window could still forge a selection.
+
+The host cannot confirm the outcome from RLSD. If a BOOT reply is lost, the
+loader may have accepted it. Treat the selection as unknown and check which
+application starts.
+
+[altboot.py](tools/altboot.py) reads the OTA flag and the target vectors with
+`dump.bin`, sends BOOT, and releases boot. It releases boot even after a failure.
+`recover.py --address ADDRESS --boot` writes and verifies a raw image, then
+selects it in the same session.
+
+`altboot.py ADDRESS --load IMAGE` with an ITCM address does not change MRAM.
+It performs these steps in one session:
+
+1. It checks RAM API version 2 and the OTA flag.
+2. It uploads [ramload.c](src/examples/ramload.c) once and streams the image,
+   padded to 16 bytes, into ITCM through `recv`.
+3. It checks the CRC of the loaded range with `checksum.bin`, then sends BOOT.
+
+It releases boot after a failure too; nothing persistent has changed. The
+loader accepts `[0x1000, 0x40000)` with a 16-byte-aligned address and length. It
+reports progress the same way as the MRAM writer. Power loss clears ITCM. A
+warm reset can leave the contents in place, but the next boot does not select
+them.
 
 ## Execution ABI
 
@@ -247,7 +334,10 @@ the host responds with end-of-stream. Python callers can pass a
 `source(capacity) -> bytes` callable to `Client.execute`. Programs can alternate
 input and output; each callback still uses one request/reply exchange at a time.
 
-The program runs synchronously in the protocol worker. The `send` callback
+The program runs synchronously in the protocol worker, on its 4 KiB stack.
+About 2.9 KiB remain at program entry, measured in emulation with the build in
+this tree. The RTOS stack limit (PSPLIM) faults a deeper program instead of
+letting it write past the stack. The `send` callback
 splits data into OUTPUT replies with a maximum of 16 bytes each. It waits for
 OUTPUT_ACK after each reply. If no previous send failed, a zero-size send
 succeeds without a packet.
@@ -313,7 +403,7 @@ The writer accepts physical MRAM addresses in `[0x00400000, 0x00800000)`.
 An active stock OTA flag does not block programming. It calls the stock 2.3.2.14 MRAM routine
 at Thumb address `0x0042E83D` with the programming key, source, destination,
 and word count. The host checks the stock bootloader SHA-256 before using this
-binding, with the known hook restored in its copy of the bytes.
+binding, with the known hooks restored in its copy of the bytes.
 
 The stock routine saves interrupt state, enables ROM access, calls the ROM
 programming service, cleans up, and restores interrupt state. The uploaded
