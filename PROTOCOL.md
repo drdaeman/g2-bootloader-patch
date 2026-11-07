@@ -9,6 +9,7 @@ has no commands to write firmware images or files.
 
 The supported target uses these versions:
 
+- Wire protocol: **2**; RAM API: **3**
 - Bootloader: **2.3.2.14**
 - Main application: **2.4.0.24**
 - Hardware: **5**
@@ -30,12 +31,13 @@ these files before OTA starts.
 ## Packet format
 
 All offsets start at zero. Integer fields are unsigned and little-endian.
-Checksums are byte sums modulo 256. ASCII markers are literal bytes.
+Control checksums are byte sums modulo 256. Streaming blocks use CRC32.
+ASCII markers are literal bytes.
 The protocol has no escaping, sequence numbers, or retransmission.
 HOLD and OKAY use HMAC. Later commands and replies have no MAC.
 
 HELO contains the protocol version as a little-endian `uint32_t` at bytes 12–15.
-The current version is **`0x00000001`**, sent as `01 00 00 00`.
+The current version is **`0x00000002`**, sent as `02 00 00 00`.
 Reject an unsupported version before sending HOLD. Its challenge starts at byte 16.
 No other packet contains the challenge.
 
@@ -63,6 +65,37 @@ Loader commands and replies contain no nonce or sequence number.
 The reference implementations are
 [handshake.py](tools/g2patch/handshake.py) and
 [protocol.py](tools/g2patch/protocol.py).
+
+### Streaming blocks
+
+Version 2 carries callback data in self-describing blocks of up to **1,024 data
+bytes**, or **1,036 bytes total** including the header and CRC. Control packets
+and streaming blocks use their own fixed prefixes within the same authenticated
+session.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `BLK2` |
+| 4 | 2 | Kind, little-endian |
+| 6 | 2 | Data length, little-endian |
+| 8 | length | Data |
+| 8 + length | 4 | Little-endian CRC32 of the header and data |
+
+| Kind | Value | Data |
+|---|---|---|
+| OUTPUT | 1 | 1–1,024 output bytes |
+| INPUT_DATA | 2 | 0–advertised-capacity input bytes; zero means end-of-stream |
+| OUTPUT_ACK | 3 | Empty |
+| INPUT_REQUEST | 4 | A little-endian `u16` capacity, 1–1,024 |
+
+The CRC is `zlib.crc32(frame_without_crc)`. A receiver validates the complete
+length and CRC before delivering bytes. One block is outstanding at a time.
+The reader/writer maintains the running cursor, checks the expected total
+length, and verifies the final memory-range CRC. An uncertain transaction ends
+the operation; another attempt starts with a fresh boot handshake.
+
+For example, the output block containing `abc` is
+`42 4c 4b 32 01 00 03 00 61 62 63 82 d6 b8 d1`.
 
 ## Handshake key and tags
 
@@ -145,17 +178,12 @@ The request operation is byte 8. Its payload starts at byte 9.
 | LOAD | 1 | 9: length `u16`; 11: entry offset `u16`; 13: arg0 `u32`; 17: arg1 `u32`; 21: image CRC32 `u32`; 25–30: zero |
 | DATA | 2 | 9: count `u8`; 10: count data bytes; remaining bytes through 30: zero |
 | RUN | 3 | All zero |
-| OUTPUT_ACK | 4 | All zero |
-| INPUT_DATA | 5 | 9: count `u8`, 0–16; 10–25: data padded to 16 bytes; 26: data CRC32 `u32`; 30: zero |
 | BOOT | 6 | 9: vector table address `u32`, or 0 to clear; 13–30: zero |
 
 The program length must be an even number from **2 to 512 bytes**.
 The entry offset must be even and less than the program length. The loader
 sets the Thumb bit. Each DATA packet contains **1–16 bytes**. The count must
 not exceed the remaining image length.
-
-INPUT_DATA carries the same CRC-32 variant used by LOAD, calculated over the
-counted data bytes only. Count 0 signals end-of-stream and has CRC32 0.
 
 DATA has no offset field. The loader appends each block to the bytes already
 received. Use one channel that preserves packet order. Wait for each reply
@@ -166,11 +194,9 @@ The reply kind and status are bytes 12 and 13. Reply data starts at byte 14.
 | Kind | Value | Status | Data |
 |---|---|---|---|
 | ACK | 0 | 0 | Zero; LOAD, BOOT, or a DATA packet before the last packet was accepted |
-| OUTPUT | 1 | Byte count, 1–16 | The specified number of callback bytes |
 | RESULT | 2 | 0, or IO_ERROR (5) | Program return value `u32` at 14; remaining bytes zero |
 | READY | 3 | 0 | Zero; the complete image passed the CRC check and is available |
 | ERROR | 4 | Error code below | Zero |
-| INPUT | 5 | Capacity, 1–16 | Zero; the program is waiting for input |
 
 | Error code | Value | Meaning |
 |---|---|---|
@@ -208,7 +234,8 @@ RUN makes the program unavailable before it calls the entry point.
 Upload the complete program again before another execution. The last DATA
 packet produces READY without an additional ACK. A nonzero program return
 value is application data. It is not a protocol error if RESULT status is zero.
-OUTPUT_ACK or INPUT_DATA outside its callback exchange produces BAD_REQUEST.
+Streaming blocks belong to their callback exchange. An unexpected packet in
+the command loop aborts the session.
 
 After BAD_REQUEST, BAD_CRC, BAD_TARGET, or UNAVAILABLE, the loader can still accept commands.
 However, the reference host marks the session as failed after any ERROR reply.
@@ -292,7 +319,7 @@ selects it in the same session.
 `altboot.py ADDRESS --load IMAGE` with an ITCM address does not change MRAM.
 It performs these steps in one session:
 
-1. It checks RAM API version 2 and the OTA flag.
+1. It checks RAM API version >= 2 and the OTA flag.
 2. It uploads [ramload.c](src/examples/ramload.c) once and streams the image,
    padded to 16 bytes, into ITCM through `recv`.
 3. It checks the CRC of the loaded range with `checksum.bin`, then sends BOOT.
@@ -309,7 +336,7 @@ Use Thumb position-independent code. The program must return normally.
 
 ```c
 typedef struct {
-    uint32_t version;  /* 2 */
+    uint32_t version;  /* 3 */
     int (*send)(void *context, const void *data, uint32_t size);
     void *context;
     int (*recv)(void *context, void *data, uint32_t size);
@@ -319,11 +346,11 @@ uint32_t entry(const ram_api *api, uint32_t arg0, uint32_t arg1);
 /* send(api->context, bytes, count): 0 success, -1 failure */
 ```
 
-API version 2 appends `recv` after the version-1 fields. Programs using only
-that prefix can still run. A program that needs `recv` must check `version >= 2`
-before accessing it.
+API version 3 retains the version-2 layout and expands the input chunk limit.
+Version 2 appended `recv` after the version-1 fields. A program that needs
+`recv` must check `version >= 2` before accessing it.
 
-`recv` requests one chunk with capacity `min(size, 16)`, then waits for
+`recv` requests one chunk with capacity `min(size, 1024)`, then waits for
 INPUT_DATA. It returns the number of bytes copied, 0 for end-of-stream, or -1
 on failure. A zero-size call returns 0 without a packet. The count must not
 exceed the advertised capacity, and the data CRC32 must match before any bytes
@@ -334,11 +361,11 @@ the host responds with end-of-stream. Python callers can pass a
 `source(capacity) -> bytes` callable to `Client.execute`. Programs can alternate
 input and output; each callback still uses one request/reply exchange at a time.
 
-The program runs synchronously in the protocol worker, on its 4 KiB stack.
-About 2.9 KiB remain at program entry, measured in emulation with the build in
-this tree. The RTOS stack limit (PSPLIM) faults a deeper program instead of
-letting it write past the stack. The `send` callback
-splits data into OUTPUT replies with a maximum of 16 bytes each. It waits for
+The program runs synchronously on the protocol worker's 4 KiB stack, shared
+with the trampoline and callbacks. Programs must budget their locals together
+with callback stack use. The RTOS stack limit (PSPLIM) faults a deeper program
+instead of letting it write past the stack. The `send` callback computes CRC
+while transmitting and splits data into OUTPUT blocks of up to 1,024 bytes. It waits for
 OUTPUT_ACK after each reply. If no previous send failed, a zero-size send
 succeeds without a packet.
 
@@ -375,6 +402,11 @@ The normal command wait has no timeout. After a frame starts, reception fails
 if no new byte arrives for 128 ticks (125 ms). Each DATA, INPUT_DATA, or OUTPUT_ACK wait has
 an overall timeout of 2048 ticks (2 s).
 
+After rejecting a streaming block, the receiver discards incoming bytes until
+the 128-tick quiet interval or the same overall deadline. This lets the case
+finish transmitting before an error reply, even if a corrupted header
+understates the frame length.
+
 Each temple transmission uses a local polling timeout of 21 ticks
 (approximately 20.5 ms). Loader replies, OKAY, and RLSD also have a 6-tick delay
 before transmission to allow the direction to change.
@@ -392,6 +424,12 @@ After deleting a claimed session's worker, the manager makes one final bounded,
 best-effort kick, including sessions released before its first checkpoint. A
 successful kick gives the following boot path a fresh period; failure does not
 block release. The launched application owns subsequent watchdog service.
+
+The worker publishes its UART receive window before requesting input. The
+manager defers PMIC access until that window closes, keeping its I2C critical
+section outside reception of a long frame. The callback yields after each
+validated input block so the manager can service its deadline between blocks.
+Active frame I/O uses bounded polling to keep the UART FIFO serviced.
 
 Interrupts are masked during the temporary IOM7 ownership. All power/bus polls
 share a 250,000-CPU-cycle DWT deadline and a 32,768-poll fallback if CYCCNT is
@@ -498,14 +536,15 @@ on the host. Complete this exchange within the temple's 500 ms boot window.
 
 | Direction | Packet |
 |---|---|
-| Host → case | `G2TX`, length `u8`, temple packet[length], checksum `u8` |
-| Case → host | `G2RX`, status `u8`, length `u8`, temple packet[length], checksum `u8` |
+| Host → case | `G2TX`, length `u16`, temple packet[length], checksum `u8` |
+| Case → host | `G2RX`, status `u8`, length `u16`, temple packet[length], checksum `u8` |
 | Host → case | `G2EX` (four bytes, no checksum; exits the relay) |
 
 Each outer checksum is the sum of all preceding bytes in that packet,
-modulo 256. G2TX length is 9, 25, or 32. Use length 0 to receive without a
-transmission to the temple. G2RX length is 13, 21, 29, or 32 after a successful receive.
-Otherwise, it is 0.
+modulo 256. Length fields are little-endian. G2TX carries a control packet
+(9, 25, or 32 bytes), a streaming block (12–1,036 bytes), or length 0 for a
+receive-only transaction. G2RX carries an announcement, control reply, or
+streaming block, up to 1,036 bytes. Receive failure has length 0.
 
 | Relay status | Meaning |
 |---|---|

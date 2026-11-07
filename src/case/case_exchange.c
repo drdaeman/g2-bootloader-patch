@@ -4,6 +4,7 @@
  * Interrupts are already masked by its entry. No case flash writes.
  */
 #include <stdint.h>
+#include "../wire.h"
 #define W(a) (*(volatile uint32_t *)(uintptr_t)(a))
 #define RESULT ((volatile uint32_t *)0x20011a00u)
 #define CAPTURE ((volatile uint8_t *)0x20011a56u)
@@ -119,13 +120,24 @@ static unsigned relay_receive(uint8_t *p) {
         if (!(flags & 32u))
             continue;
         p[at] = (uint8_t)RDR;
-        CAPTURE[at] = p[at];
+        if (at < 32u)
+            CAPTURE[at] = p[at];
         at++;
         if (at == 4) {
-            if (p[0] != 0x5a || p[1] != 0xa5 || p[2] != 255 ||
-                (p[3] != 8 && p[3] != 16 && p[3] != 24 && p[3] != 27))
+            if (p[0] == 'B' && p[1] == 'L' && p[2] == 'K' && p[3] == '2') {
+                needed = 8;
+            } else if (p[0] == 0x5a && p[1] == 0xa5 && p[2] == 255 &&
+                       (p[3] == 8 || p[3] == 16 || p[3] == 24 || p[3] == 27)) {
+                needed = p[3] + 5u;
+            } else {
                 return 0;
-            needed = p[3] + 5u;
+            }
+        }
+        if (at == 8 && p[0] == 'B') {
+            unsigned n = (unsigned)p[6] | (unsigned)p[7] << 8;
+            if (n > WIRE_BLOCK_DATA)
+                return 0;
+            needed = n + 12u;
         }
         if (at == needed)
             return at;
@@ -139,9 +151,9 @@ void exchange(void) {
     if (!case_watchdog_start())
         return;
     uint32_t last_feed = W(CASE_TIM2 + 0x24u) - 5000u;
-    /* Console packets G2TX,len,data,sum; G2EX exits. One temple reply per
+    /* Console packets G2TX,len16,data,sum; G2EX exits. One temple reply per
      * operation, so callback DATA/ACK never races a second output frame. */
-    uint8_t p[33], console[39], head[5];
+    uint8_t p[WIRE_BLOCK_MAX + 1u], console[WIRE_BLOCK_MAX + 8u], head[6];
     RESULT[10] = RESULT[11] = RESULT[12] = RESULT[13] = 0;
     HOST_SEND("G2RAM_READY\n", 12);
     while (host_read(head, 4)) {
@@ -149,15 +161,15 @@ void exchange(void) {
             break;
         if (head[2] == 'E' && head[3] == 'X')
             break;
-        if (head[2] != 'T' || head[3] != 'X' || !host_read(head + 4, 1))
+        if (head[2] != 'T' || head[3] != 'X' || !host_read(head + 4, 2))
             break;
-        unsigned n = head[4], status = 0;
-        if (n != 0 && n != 9 && n != 25 && n != 32)
+        unsigned n = (unsigned)head[4] | (unsigned)head[5] << 8, status = 0;
+        if (n != 0 && n != 9 && n != 25 && n != 32 && (n < 12u || n > WIRE_BLOCK_MAX))
             break;
         if (!host_read(p, n + 1))
             break;
         unsigned sum = 0;
-        for (unsigned i = 0; i < 5; i++)
+        for (unsigned i = 0; i < 6; i++)
             sum += head[i];
         for (unsigned i = 0; i < n; i++)
             sum += p[i];
@@ -166,7 +178,9 @@ void exchange(void) {
         if (!case_watchdog_service(&last_feed))
             break;
         if (n) {
-            if (p[0] != 0x7e || p[1] != 0 || p[2] != 1 || p[3] != n - 5u)
+            int block = p[0] == 'B' && p[1] == 'L' && p[2] == 'K' && p[3] == '2';
+            if (block ? (n < 12u || n != 12u + ((unsigned)p[6] | (unsigned)p[7] << 8))
+                      : (p[0] != 0x7e || p[1] != 0 || p[2] != 1 || p[3] != n - 5u))
                 break;
             TX_PROFILE();
             __asm__ volatile("cpsid i" ::: "memory");
@@ -185,13 +199,14 @@ void exchange(void) {
         console[3] = 'X';
         console[4] = (uint8_t)status;
         console[5] = (uint8_t)n;
+        console[6] = (uint8_t)(n >> 8);
         sum = 0;
         for (unsigned i = 0; i < n; i++)
-            console[6 + i] = p[i];
-        for (unsigned i = 0; i < n + 6; i++)
+            console[7 + i] = p[i];
+        for (unsigned i = 0; i < n + 7; i++)
             sum += console[i];
-        console[n + 6] = (uint8_t)sum;
-        HOST_SEND(console, n + 7);
+        console[n + 7] = (uint8_t)sum;
+        HOST_SEND(console, n + 8);
     }
     RESULT[11] = RESULT[12] = 0;
     case_watchdog_stop();

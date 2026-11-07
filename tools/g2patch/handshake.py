@@ -6,7 +6,7 @@ import struct
 
 from .auth import tag
 
-VERSION = 1
+VERSION = 2
 
 
 def _announcement(marker, payload=b""):

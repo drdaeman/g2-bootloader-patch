@@ -72,12 +72,12 @@ class Examples(unittest.TestCase):
             result, output = self.run_example("dump", 0x20001000, size, data)
             self.assertEqual(result, 0)
             self.assertEqual(b"".join(output), data)
-            self.assertTrue(all(0 < len(part) <= 128 for part in output))
+            self.assertEqual(output, [data] if data else [])
 
     def test_dump_stops_on_send_failure(self):
         data = bytes(range(256)) * 2
         result, output = self.run_example(
-            "dump", 0x20001000, len(data), data, fail_at=2
+            "dump", 0x20001000, len(data), data, fail_at=1
         )
         self.assertEqual(result, 1)
-        self.assertEqual(b"".join(output), data[:256])
+        self.assertEqual(output, [data])

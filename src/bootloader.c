@@ -22,8 +22,12 @@ typedef struct {
     uint32_t arg0, arg1;
 } program;
 typedef struct {
-    volatile uint32_t held, target, claimed;
+    volatile uint32_t held, target, claimed, receiving;
 } session;
+typedef struct {
+    int failed;
+    session *owner;
+} callback_context;
 typedef struct {
     const char *name;
     uint32_t bits;
@@ -46,12 +50,16 @@ static void put32(uint8_t *p, uint32_t n) {
     for (unsigned i = 0; i < 4; i++)
         p[i] = (uint8_t)(n >> (8 * i));
 }
+static uint32_t crc32_byte(uint32_t c, uint8_t b) {
+    c ^= b;
+    for (unsigned i = 0; i < 8; i++)
+        c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+    return c;
+}
 static uint32_t crc32(const uint8_t *p, unsigned n) {
     uint32_t c = 0xffffffffu;
     while (n--) {
-        c ^= *p++;
-        for (unsigned i = 0; i < 8; i++)
-            c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+        c = crc32_byte(c, *p++);
     }
     return ~c;
 }
@@ -98,29 +106,41 @@ static void direction(unsigned tx) {
     GPIO(p[tx ? 1 : 0], GPIO_PARK_FUNCTION);
     GPIO(p[tx ? 0 : 1], p[tx ? 2 : 3]);
 }
-/* The finite per-send bound is local. No session deadline or IRQ completion. */
-static int transmit(const uint8_t *p, unsigned n) {
+/* Polling keeps a long frame moving between RTOS ticks. */
+static int transmit_frame(const uint8_t *head, unsigned head_size, const uint8_t *data,
+                          unsigned data_size, int checksum) {
     uint32_t start = TICK;
+    uint32_t crc = 0xffffffffu;
+    unsigned body = head_size + data_size;
     int ok = 0;
     direction(1);
-    for (unsigned i = 0; i < n; i++) {
+    for (unsigned i = 0; i < body + (checksum ? 4u : 0u); i++) {
+        uint8_t b;
+        if (i >= body)
+            b = (uint8_t)(~crc >> (8u * (i - body)));
+        else {
+            b = i < head_size ? head[i] : data[i - head_size];
+            if (checksum)
+                crc = crc32_byte(crc, b);
+        }
         while (W(UART2_FLAGS) & UART_FLAG_TX_FULL) {
             if ((uint32_t)(TICK - start) >= 21u)
                 goto done;
-            DELAY(1);
         }
-        W(UART2_DATA) = p[i];
+        W(UART2_DATA) = b;
     }
     while (W(UART2_FLAGS) & UART_FLAG_BUSY) {
         if ((uint32_t)(TICK - start) >= 21u)
             goto done;
-        DELAY(1);
     }
     ok = 1;
 done:
 
     direction(0);
     return ok;
+}
+static int transmit(const uint8_t *p, unsigned n) {
+    return transmit_frame(p, n, 0, 0, 0);
 }
 static void continue_request(uint8_t *p) {
     p[0] = 0x7e;
@@ -175,8 +195,9 @@ static unsigned receive(uint8_t *p, uint32_t timeout) {
         uint8_t b = (uint8_t)dr;
         last = now;
         if (!at) {
-            if (b == 0x7e)
-                p[at++] = b;
+            if (b != 0x7e)
+                return 0;
+            p[at++] = b;
             continue;
         }
         if ((at == 1 && b != 0) || (at == 2 && b != 1) ||
@@ -248,6 +269,8 @@ static int load(uint8_t *code, program *available, uint8_t *p) {
     }
     return 1;
 }
+#include "block.h"
+
 __attribute__((used, noinline)) static int send_output(void *context, const void *data,
                                                        uint32_t size) {
     int *failed = context;
@@ -255,12 +278,11 @@ __attribute__((used, noinline)) static int send_output(void *context, const void
     if (*failed)
         return -1;
     while (size) {
-        unsigned n = size > 16u ? 16u : size;
-        if (!reply(OUTPUT, n, p, n))
+        unsigned n = size > WIRE_BLOCK_DATA ? WIRE_BLOCK_DATA : size;
+        if (!block_send(BLOCK_OUTPUT, p, n))
             goto error;
-        uint8_t ack[32];
-        unsigned got = receive(ack, IO_WAIT_TICKS);
-        if (!command(ack, got, OUTPUT_ACK))
+        uint8_t ack[12];
+        if (!block_receive(ack, 0, BLOCK_ACK))
             goto error;
         p += n;
         size -= n;
@@ -277,19 +299,28 @@ __attribute__((used, noinline)) static int recv_input(void *context, void *data,
         return -1;
     if (!size)
         return 0;
-    unsigned capacity = size > 16u ? 16u : size;
-    if (!reply(INPUT, capacity, 0, 0))
+    unsigned capacity = size > WIRE_BLOCK_DATA ? WIRE_BLOCK_DATA : size;
+    uint8_t wanted[2] = {(uint8_t)capacity, (uint8_t)(capacity >> 8)};
+    callback_context *callback = context;
+    if (callback->owner)
+        callback->owner->receiving = 1;
+    if (!block_send(BLOCK_REQUEST, wanted, sizeof(wanted)))
         goto error;
-    uint8_t packet[32];
-    unsigned got = receive(packet, IO_WAIT_TICKS), n = packet[9];
-    if (!command(packet, got, INPUT_DATA) || n > capacity ||
-        crc32(packet + 10, n) != u32(packet + 26))
+    uint8_t packet[WIRE_BLOCK_MAX];
+    if (!block_receive(packet, capacity, BLOCK_INPUT))
         goto error;
+    unsigned n = u16(packet + 6);
     uint8_t *out = data;
     for (unsigned i = 0; i < n; i++)
-        out[i] = packet[10 + i];
+        out[i] = packet[8 + i];
+    if (callback->owner)
+        callback->owner->receiving = 0;
+    /* Give the manager a service opportunity between input blocks. */
+    DELAY(1);
     return (int)n;
 error:
+    if (((callback_context *)context)->owner)
+        ((callback_context *)context)->owner->receiving = 0;
     *failed = 1;
     return -1;
 }
@@ -349,18 +380,19 @@ static void commands(session *s) {
             }
             program header = available;
             available.length = 0;
-            int failed = 0;
+            callback_context callback = {0, s};
             uintptr_t send, recv;
             __asm__ volatile("adr %0, send_output\n orr %0,%0,#1" : "=r"(send));
             __asm__ volatile("adr %0, recv_input\n orr %0,%0,#1" : "=r"(recv));
-            ram_api api = {2, (void *)send, &failed, (void *)recv};
+            ram_api api = {3, (void *)send, &callback, (void *)recv};
             boot_ram_call call = {((uintptr_t)code + header.entry) | 1u, &api,
                                   header.arg0, header.arg1, 0};
             boot_ram_sync(code, header.length);
             boot_ram_invoke(&call);
             uint8_t result[4];
             put32(result, call.result);
-            if (!reply(RESULT, failed ? IO_ERROR : 0, result, 4) || failed)
+            if (!reply(RESULT, callback.failed ? IO_ERROR : 0, result, 4) ||
+                callback.failed)
                 goto wait_continue;
         } else if (command(p, got, BOOT)) {
             /* Every BOOT first clears the selection; target 0 only clears it. */
@@ -431,6 +463,7 @@ uint32_t boot_task_then_flag(void) {
     s.held = 0;
     s.target = 0;
     s.claimed = 0;
+    s.receiving = 0;
     /* RAM can survive a reset; never inherit a previous boot's selection. */
     boot_select(0);
     if (!W(BOOT_UART2_HANDLE_SLOT) ||

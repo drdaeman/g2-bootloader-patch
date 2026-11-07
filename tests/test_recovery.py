@@ -316,7 +316,7 @@ class TransactionJournal(unittest.TestCase):
             )
             link.port = Mock()
             frame = bytes.fromhex("5aa5ff0800010304524c534443")
-            header = b"G2RX" + bytes([0, len(frame)])
+            header = b"G2RX" + bytes((0,)) + struct.pack("<H", len(frame))
             tail = frame + bytes([sum(header + frame) & 255])
             with patch("g2patch.link.read_exact", side_effect=[header, tail] * 100):
                 for _ in range(100):

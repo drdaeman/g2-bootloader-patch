@@ -11,9 +11,6 @@ The case program runs in RAM; case flash does not change.
 Only the stock **2.3.2.14 bootloader** is supported. The patch tool checks its
 SHA-256 before it changes any bytes. The case relay requires **case 1.2.57**.
 
-The UART2 loader passed emulator tests and hardware tests on both temples
-with **hardware 5** and **main application 2.4.0.24**.
-
 ## Introduction
 
 Even Realities G2 smart glasses are an excellent piece of hardware, and their
@@ -130,6 +127,11 @@ python3 tools/flash.py build/bootloader.bin \
 The tool writes the bootloader using the stock OTA mechanism.
 After that, it resets the temple and uses the newly installed bootloader
 to read back the installed image CRC twice to verify the write.
+
+In case of BLE issues, as a first measure, try clearing the computer's bond
+for the glasses and pairing anew. Sometimes, for reasons I've yet to understand,
+stock glasses firmware behaves oddly and forgets the bond, rejecting future
+connections as they send the first encrypted packet.
 
 Check that the main application starts before you install on the other temple.
 Use `--side left` and the left temple's address for the other temple.

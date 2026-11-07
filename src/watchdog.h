@@ -101,7 +101,7 @@ static void boot_watchdog_hold(session *s) {
     uint32_t last = TICK, interval = 0;
     while (s->held) {
         uint32_t now = TICK;
-        if ((uint32_t)(now - last) >= interval) {
+        if (!s->receiving && (uint32_t)(now - last) >= interval) {
             interval = boot_watchdog_feed() ? 5120u : 1024u;
             last = TICK;
         }

@@ -11,6 +11,53 @@ import zlib
 LOAD, DATA, RUN, OUTPUT_ACK, INPUT_DATA, BOOT = 1, 2, 3, 4, 5, 6
 ACK, OUTPUT, RESULT, READY, ERROR, INPUT = 0, 1, 2, 3, 4, 5
 UNAVAILABLE, BAD_REQUEST, BAD_CRC, ABORTED, IO_ERROR, BAD_TARGET = 1, 2, 3, 4, 5, 6
+BLOCK_MAGIC = b"BLK2"
+BLOCK_DATA = 1024
+BLOCK_MAX = BLOCK_DATA + 12
+BLOCK_OUTPUT, BLOCK_INPUT, BLOCK_ACK, BLOCK_REQUEST = 1, 2, 3, 4
+
+
+def block(kind, data=b""):
+    if kind not in (BLOCK_OUTPUT, BLOCK_INPUT, BLOCK_ACK, BLOCK_REQUEST):
+        raise ValueError("invalid block kind")
+    if len(data) > BLOCK_DATA:
+        raise ValueError("block exceeds 1 KiB payload limit")
+    if (kind == BLOCK_OUTPUT and not data) or (kind == BLOCK_ACK and data):
+        raise ValueError("invalid block length")
+    if kind == BLOCK_REQUEST and (
+        len(data) != 2 or not 1 <= int.from_bytes(data, "little") <= BLOCK_DATA
+    ):
+        raise ValueError("invalid input capacity")
+    body = struct.pack("<4sHH", BLOCK_MAGIC, kind, len(data)) + data
+    return body + struct.pack("<I", zlib.crc32(body))
+
+
+def decode_block(frame):
+    if not 12 <= len(frame) <= BLOCK_MAX or frame[:4] != BLOCK_MAGIC:
+        raise ValueError("invalid block framing")
+    _, kind, length = struct.unpack_from("<4sHH", frame)
+    if len(frame) != length + 12:
+        raise ValueError("block length mismatch")
+    if zlib.crc32(frame[:-4]) != struct.unpack_from("<I", frame, len(frame) - 4)[0]:
+        raise ValueError("block CRC mismatch")
+    data = frame[8:-4]
+    if block(kind, data) != frame:
+        raise ValueError("invalid block")
+    return kind, data
+
+
+def decode_transfer_reply(frame):
+    if frame.startswith(BLOCK_MAGIC):
+        kind, data = decode_block(frame)
+        if kind == BLOCK_OUTPUT:
+            return OUTPUT, len(data), data
+        if kind == BLOCK_REQUEST:
+            return INPUT, int.from_bytes(data, "little"), b""
+        raise ValueError("unexpected block reply kind")
+    kind, status, data = decode_reply(frame)
+    if kind in (OUTPUT, INPUT):
+        raise ValueError("streaming requires protocol version 2 blocks")
+    return kind, status, data
 
 
 def request(operation, payload=b""):
@@ -47,11 +94,11 @@ def decode_reply(frame):
     if frame[-1] != ((25 + sum(frame[4:-1])) & 255):
         raise ValueError("reply checksum failed")
     kind, status = frame[12:14]
-    if kind > INPUT or (kind in (OUTPUT, INPUT) and not 1 <= status <= 16):
+    if kind not in (ACK, RESULT, READY, ERROR):
         raise ValueError("invalid reply kind or count")
     if kind in (ACK, READY) and status:
         raise ValueError("invalid acknowledgement status")
-    return kind, status, frame[14 : 14 + status] if kind == OUTPUT else frame[14:30]
+    return kind, status, frame[14:30]
 
 
 class RemoteError(RuntimeError):
@@ -71,7 +118,7 @@ class Client:
                 "session failed; use CONTINUE and a fresh boot handshake"
             )
         try:
-            kind, status, data = decode_reply(self.exchange(packet))
+            kind, status, data = decode_transfer_reply(self.exchange(packet))
             if kind == ERROR:
                 raise RemoteError(status)
             if kind == RESULT and status:
@@ -128,7 +175,7 @@ class Client:
                     output.extend(data)
                     if callback:
                         callback(data)
-                    packet = request(OUTPUT_ACK)
+                    packet = block(BLOCK_ACK)
                 else:
                     chunk = source(_status) if source else b""
                     if (
@@ -139,10 +186,7 @@ class Client:
                             "input source exceeded the requested chunk size"
                         )
                     chunk = bytes(chunk)
-                    packet = request(
-                        INPUT_DATA,
-                        struct.pack("<B16sI", len(chunk), chunk, zlib.crc32(chunk)),
-                    )
+                    packet = block(BLOCK_INPUT, chunk)
                 kind, _status, data = self._exchange(packet)
             if kind != RESULT:
                 raise ValueError("RUN did not produce a result")

@@ -138,8 +138,8 @@ class BuildPins(unittest.TestCase):
     def test_pinned_artifacts_reproduce(self):
         # Reproducible default-key build pins.
         pins = {
-            "patch": "fc65b795444126df6579b07d562109a7368fc9ffb77a934fe4bb1dc063b82179",
-            "case": "b7e915c2cde44db8ba7273c0b7bf04fb15216ba6d9e2732f515588a1ff7f609e",
+            "patch": "8d3836ae656dd70dd2b711381784e0f5b2a536696557253cced41b55446974bf",
+            "case": "004ce36d9cf8d77e2931e27574f34f34a219a92699b9b44e09c8b0e9f93225a9",
             "echo": "50e2d81ef7b26978ab8be1c722a27924b06217945ae7c4cd9c92beb39a9590dc",
         }
         for name, expected in pins.items():
@@ -158,8 +158,8 @@ class BuildPins(unittest.TestCase):
 
 class ProtocolTests(unittest.TestCase):
     def test_handshake_wire_vector(self):
-        frame = bytes.fromhex("5aa5ff100001030c48454c4f01000000454c52325c")
-        self.assertEqual(frame[12:16], bytes.fromhex("01000000"))
+        frame = bytes.fromhex("5aa5ff100001030c48454c4f02000000454c52325d")
+        self.assertEqual(frame[12:16], bytes.fromhex("02000000"))
         challenge = decode_hello(frame)
         self.assertEqual(frame, hello(challenge))
         self.assertEqual(len(hold(challenge)), 25)
@@ -167,7 +167,7 @@ class ProtocolTests(unittest.TestCase):
         check_okay(okay(challenge), challenge)
 
     def test_unsupported_hello_version_is_rejected(self):
-        for version in (2, 0x00000101, 0x00010001, 0x01000001):
+        for version in (1, 3, 0x00000101, 0x00010001, 0x01000001):
             with self.subTest(version=version):
                 frame = bytearray(hello(123))
                 struct.pack_into("<I", frame, 12, version)
@@ -206,7 +206,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_callback_crc_error_stops_without_ack_or_retry(self):
         sent = []
-        bad = bytearray(protocol.reply(protocol.OUTPUT, 3, b"abc"))
+        bad = bytearray(protocol.block(protocol.BLOCK_OUTPUT, b"abc"))
         bad[-1] ^= 1
 
         def exchange(packet):

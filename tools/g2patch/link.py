@@ -18,7 +18,7 @@ from .case_rom import (
     write_sram,
 )
 from .handshake import check_okay, cont, decode_hello, hold, released
-from .protocol import Client, decode_reply
+from .protocol import BLOCK_MAX, Client, decode_block, decode_transfer_reply
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -138,8 +138,8 @@ class CaseLink:
         if port is None:
             raise RuntimeError("case serial connection is not open")
         if len(frame) not in (0, 9, 25, 32):
-            raise ValueError("unsupported frame length")
-        packet = b"G2TX" + bytes((len(frame),)) + frame
+            decode_block(frame)
+        packet = b"G2TX" + struct.pack("<H", len(frame)) + frame
         packet += bytes((sum(packet) & 255,))
         event = {"request": frame.hex()}
         if self.stream_transactions:
@@ -151,10 +151,11 @@ class CaseLink:
         self.record_transaction(event)
         port.write(packet)
         port.flush()
-        head = read_exact(port, 6, "relay response")
-        if head[:4] != b"G2RX" or head[5] > 32:
+        head = read_exact(port, 7, "relay response")
+        length = struct.unpack_from("<H", head, 5)[0]
+        if head[:4] != b"G2RX" or length > BLOCK_MAX:
             raise ValueError("invalid relay header")
-        tail = read_exact(port, head[5] + 1, "temple response")
+        tail = read_exact(port, length + 1, "temple response")
         event["reply"] = (head + tail).hex()
         self.record_transaction(event)
         if tail[-1] != (sum(head) + sum(tail[:-1])) & 255:
@@ -175,7 +176,7 @@ class CaseLink:
                 self.report["continued"] = True
                 self.save()
                 return
-            decode_reply(actual)
+            decode_transfer_reply(actual)
         raise RuntimeError("boot release unconfirmed after three CONTINUE exchanges")
 
     def close(self):
@@ -256,7 +257,7 @@ def run(
         / "build/runs"
         / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     )
-    link = CaseLink(port, out, side)
+    link = CaseLink(port, out, side, stream_transactions=True)
     print(f"Audit: {out}")
     with link:
         try:

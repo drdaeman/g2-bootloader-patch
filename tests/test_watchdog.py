@@ -191,7 +191,12 @@ class HeldSession(unittest.TestCase):
         self.run_session(0, False, early=True, fail_final=True)
         self.run_session(0, False, fail_final=True)
 
-    def run_session(self, start, fail_first, early=False, fail_final=False):
+    def test_feed_waits_for_the_input_block_boundary(self):
+        self.run_session(0, False, receive_until=2048)
+
+    def run_session(
+        self, start, fail_first, early=False, fail_final=False, receive_until=0
+    ):
         native = Native()
         for addr, value in (
             (0x20000494, 1),
@@ -205,18 +210,23 @@ class HeldSession(unittest.TestCase):
         def checkpoint(c):
             nonlocal held
             held = c.reg_read(UC_ARM_REG_R0)
-            c.mem_write(held, struct.pack("<3I", int(not early), 0, 1))
+            c.mem_write(
+                held, struct.pack("<4I", int(not early), 0, 1, int(receive_until > 0))
+            )
             return int(not early)
 
         def delay(c):
             nonlocal elapsed
             if held is not None:
                 elapsed += 512
+                if elapsed >= receive_until:
+                    c.mem_write(held + 12, bytes(4))
                 if elapsed >= 40960:
                     c.mem_write(held, bytes(4))
             return 0
 
         def feed(c):
+            self.assertEqual(native.words(held + 12, 1)[0], 0)
             feeds.append(elapsed)
             self.assertEqual(deleted, early or elapsed == 40960)
             return int(
@@ -245,7 +255,7 @@ class HeldSession(unittest.TestCase):
         expected = (
             [0, *range(1024, 40960, 5120)]
             if fail_first
-            else list(range(0, 40960, 5120))
+            else list(range(receive_until, 40960, 5120))
         )
         self.assertEqual(feeds, [0] if early else expected + [40960])
         self.assertEqual(native.words(RECORD, 3), (0, 0, 0xFFFFFFFF))

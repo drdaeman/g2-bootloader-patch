@@ -31,7 +31,7 @@ class ReleaseTests(unittest.TestCase):
             self.link,
             "exchange",
             side_effect=[
-                protocol.reply(protocol.OUTPUT, 3, b"abc"),
+                protocol.block(protocol.BLOCK_OUTPUT, b"abc"),
                 protocol.reply(protocol.RESULT, 5),
                 self.released,
             ],
@@ -78,7 +78,9 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_attempts_are_bounded(self):
         with patch.object(
-            self.link, "exchange", return_value=protocol.reply(protocol.OUTPUT, 1, b"x")
+            self.link,
+            "exchange",
+            return_value=protocol.block(protocol.BLOCK_OUTPUT, b"x"),
         ) as exchange:
             with self.assertRaisesRegex(RuntimeError, "release unconfirmed"):
                 self.link.continue_boot()

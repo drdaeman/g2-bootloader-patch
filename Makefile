@@ -58,7 +58,7 @@ build/patch.bin: build/patch.elf tools/patch.py tools/g2patch/artifacts.py
 	$(OBJCOPY) -O binary --only-section=.hook.handoff_update $< build/hook_handoff_update.bin
 	$(OBJCOPY) -O binary --only-section=.hook.handoff_boot $< build/hook_handoff_boot.bin
 	$(PYTHON) tools/patch.py --describe $< --base 0x434900 -o build/patch.json
-build/case_extension.o: src/case/case_reset_loader.c $(wildcard src/case/*.h) src/case/case_exchange.c src/string.h Makefile | build
+build/case_extension.o: src/case/case_reset_loader.c $(wildcard src/case/*.h) src/case/case_exchange.c src/string.h src/wire.h Makefile | build
 	$(CC) $(TARGET) $(CFLAGS) -mcpu=cortex-m0plus -c $< -o $@
 build/case_input.S: tools/g2patch/artifacts.py tools/g2patch/data/case.json tools/g2patch/data/case_bridge.bin $(CASE_FIRMWARE) | build
 	$(PYTHON) tools/patch.py --prepare-case --case-firmware "$(CASE_FIRMWARE)" -o $@

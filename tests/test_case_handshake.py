@@ -9,6 +9,7 @@ from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from g2patch import protocol
 from g2patch.handshake import hello, hold, okay
 
 try:
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(u, "install Unicorn to execute the case handshake checks")
 class CaseHandshake(unittest.TestCase):
-    def exchange(self, beacon, acknowledgement, bad_checksum=False):
+    def exchange(self, beacon, acknowledgement, bad_checksum=False, request=None):
         assert u is not None
         from unicorn.arm_const import (
             UC_ARM_REG_LR,
@@ -47,11 +48,12 @@ class CaseHandshake(unittest.TestCase):
         cpu.mem_write(0x20010000, image)
         cpu.mem_write(0x20011A0C, struct.pack("<I", 1))
         cpu.mem_write(0x20011A42, bytes.fromhex("81010cafa603c10522ff"))
+        cpu.mem_write(0x20011B00, b"CANARY!!")
         cpu.reg_write(UC_ARM_REG_SP, 0x2001FF00)
         cpu.reg_write(UC_ARM_REG_LR, 0x2001F101)
         incoming = deque(beacon + acknowledgement)
-        request = hold(0x32524C45)
-        command = b"G2TX" + bytes([len(request)]) + request
+        request = hold(0x32524C45) if request is None else request
+        command = b"G2TX" + struct.pack("<H", len(request)) + request
         outgoing = deque(command + bytes([(sum(command) ^ bad_checksum) & 255]))
         sent, console = [], []
 
@@ -94,6 +96,7 @@ class CaseHandshake(unittest.TestCase):
         cpu.hook_add(u.UC_HOOK_MEM_READ, read)
         cpu.hook_add(u.UC_HOOK_CODE, call)
         cpu.emu_start(entry | 1, 0x2001F100, count=1000000)
+        self.assertEqual(bytes(cpu.mem_read(0x20011B00, 8)), b"CANARY!!")
         ready = b"G2RAM_READY\n" in console
         if not ready:
             self.assertEqual(cpu.reg_read(UC_ARM_REG_PC), 0x2001F100)
@@ -107,8 +110,8 @@ class CaseHandshake(unittest.TestCase):
         self.assertEqual(sent, [hold(challenge)])
         self.assertEqual(console[2], beacon)
         reply = console[-1]
-        self.assertEqual(reply[:6], b"G2RX" + bytes([0, 29]))
-        self.assertEqual(reply[6:-1], acknowledgement)
+        self.assertEqual(reply[:7], b"G2RX" + bytes([0, 29, 0]))
+        self.assertEqual(reply[7:-1], acknowledgement)
         self.assertEqual(reply[-1], sum(reply[:-1]) & 255)
 
     def test_case_leaves_authentication_to_host(self):
@@ -118,10 +121,34 @@ class CaseHandshake(unittest.TestCase):
         ready, _sent, console = self.exchange(bytes(beacon), acknowledgement)
         self.assertTrue(ready)
         self.assertEqual(console[2], beacon)
-        self.assertEqual(console[-1][6:-1], acknowledgement)
+        self.assertEqual(console[-1][7:-1], acknowledgement)
 
     def test_bad_checksum_exits_without_feeding_or_transmitting(self):
         ready, sent, console = self.exchange(hello(123), okay(123), bad_checksum=True)
+        self.assertTrue(ready)
+        self.assertEqual(sent, [])
+        self.assertFalse(any(p.startswith(b"G2RX") for p in console))
+
+    def test_maximum_blocks_in_both_directions(self):
+        data = bytes(i & 255 for i in range(protocol.BLOCK_DATA))
+        ack = protocol.block(protocol.BLOCK_ACK)
+        for request, response in (
+            (protocol.block(protocol.BLOCK_INPUT, data), ack),
+            (ack, protocol.block(protocol.BLOCK_OUTPUT, data)),
+        ):
+            with self.subTest(input=len(request), output=len(response)):
+                ready, sent, console = self.exchange(
+                    hello(123), response, request=request
+                )
+                self.assertTrue(ready)
+                self.assertEqual(sent, [request])
+                self.assertEqual(console[-1][7:-1], response)
+                self.assertEqual(
+                    int.from_bytes(console[-1][5:7], "little"), len(response)
+                )
+
+    def test_oversized_host_frame_is_rejected(self):
+        ready, sent, console = self.exchange(hello(123), b"", request=b"x" * 1037)
         self.assertTrue(ready)
         self.assertEqual(sent, [])
         self.assertFalse(any(p.startswith(b"G2RX") for p in console))
