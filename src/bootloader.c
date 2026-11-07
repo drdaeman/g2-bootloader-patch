@@ -22,7 +22,7 @@ typedef struct {
     uint32_t arg0, arg1;
 } program;
 typedef struct {
-    volatile uint32_t held, target;
+    volatile uint32_t held, target, claimed;
 } session;
 typedef struct {
     const char *name;
@@ -35,6 +35,7 @@ typedef struct {
 _Static_assert(sizeof(thread_attributes) == 36, "stock thread ABI");
 
 #include "ram_invoke.h"
+#include "watchdog.h"
 
 static uint32_t u32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
@@ -408,6 +409,7 @@ __attribute__((used, noinline)) static void uart2_worker(void *argument) {
         if (receive(p, 0) != sizeof(expected) ||
             !auth_equal(p, expected, sizeof(expected)))
             continue;
+        s->claimed = 1;
         s->held = 1;
         uint8_t tag[16];
         auth_tag(WIRE_OKAY, challenge, tag);
@@ -428,6 +430,7 @@ uint32_t boot_task_then_flag(void) {
     session s;
     s.held = 0;
     s.target = 0;
+    s.claimed = 0;
     /* RAM can survive a reset; never inherit a previous boot's selection. */
     boot_select(0);
     if (!W(BOOT_UART2_HANDLE_SLOT) ||
@@ -456,9 +459,13 @@ uint32_t boot_task_then_flag(void) {
         if (thread) {
             boot_probe_wait();
             if (boot_task_checkpoint(&s.held))
-                while (s.held)
-                    DELAY(1);
+                boot_watchdog_hold(&s);
             DELETE(thread);
+            /* Includes a session released before the first checkpoint. The
+             * worker is gone, so it can no longer own the PMIC bus. Never
+             * delay release indefinitely if this best-effort kick fails. */
+            if (s.claimed)
+                (void)boot_watchdog_feed();
         }
     }
     (void)SLEEP(UART2_MODULE);

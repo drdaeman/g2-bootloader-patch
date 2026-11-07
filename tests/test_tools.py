@@ -138,8 +138,8 @@ class BuildPins(unittest.TestCase):
     def test_pinned_artifacts_reproduce(self):
         # Reproducible default-key build pins.
         pins = {
-            "patch": "9de0871bd7f11cb1560ebbd27a650951001fa4aa9d630d266350129315fe922c",
-            "case": "7749131ea0c69ab7ca385649ca11559b0bf8dbe2d7367745f625e3e418847c58",
+            "patch": "fc65b795444126df6579b07d562109a7368fc9ffb77a934fe4bb1dc063b82179",
+            "case": "b7e915c2cde44db8ba7273c0b7bf04fb15216ba6d9e2732f515588a1ff7f609e",
             "echo": "50e2d81ef7b26978ab8be1c722a27924b06217945ae7c4cd9c92beb39a9590dc",
         }
         for name, expected in pins.items():

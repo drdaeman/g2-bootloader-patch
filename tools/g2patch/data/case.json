@@ -37,6 +37,46 @@
       "address": 134264440,
       "length": 372,
       "sha256": "34f63e97a7d40c1bcf0f3bf11f314e3d34f1b95dfb4ac5cef7043acf6a53fcf7"
+    },
+    {
+      "address": 134229176,
+      "length": 8,
+      "sha256": "e61730d49be8413dbfe1627a624929b63309aa63756917639b6fea7c2f4a0e5b"
+    },
+    {
+      "address": 134259312,
+      "length": 50,
+      "sha256": "87fa908d5ee529476006bdff2a44e7cf598e15f1eb048c2220c157a0eb4a234b"
+    },
+    {
+      "address": 134260628,
+      "length": 14,
+      "sha256": "ba9af254a9ad99b2e1deb621bff84a9b5916a89a5dd9c7879f77d7284ea478fb"
+    },
+    {
+      "address": 134265476,
+      "length": 32,
+      "sha256": "516cb491445ca098312537b3b3dad9afa3af80de8a43487bd2b49d1a1a4e5b07"
+    },
+    {
+      "address": 134265540,
+      "length": 22,
+      "sha256": "cc9e9ccf865a1b3ab5a18211e02f0d9384790bf43c7a8adc5c795ad95ac3fe77"
+    },
+    {
+      "address": 134265576,
+      "length": 22,
+      "sha256": "48ec80e5a53819d9052dfef5babb43b80b64b47758e149394a24e0be239d941f"
+    },
+    {
+      "address": 134237488,
+      "length": 366,
+      "sha256": "acfb98867f963b4ebc0b6b61bc023964e3e4db9cbfee2f7dd00169633642a3b1"
+    },
+    {
+      "address": 134237854,
+      "length": 56,
+      "sha256": "ae3027cdf75d81aa4d34b1c6c31523c1b4bad635f77d4e8319e6205dcc459b29"
     }
   ],
   "source_case_firmware_sha256": "773b6d4cfdaf0a5a74a557e3babe8222a0ae813436b76a7437c1096d2c60d677",

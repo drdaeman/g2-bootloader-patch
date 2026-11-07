@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(u, "install Unicorn to execute the case handshake checks")
 class CaseHandshake(unittest.TestCase):
-    def exchange(self, beacon, acknowledgement):
+    def exchange(self, beacon, acknowledgement, bad_checksum=False):
         assert u is not None
         from unicorn.arm_const import (
             UC_ARM_REG_LR,
@@ -40,6 +40,10 @@ class CaseHandshake(unittest.TestCase):
         cpu.mem_map(0x08000000, 0x10000)
         cpu.mem_map(0x40004000, 0x1000)
         cpu.mem_map(0x40013000, 0x1000)
+        cpu.mem_map(0x40000000, 0x1000)
+        cpu.mem_map(0x40021000, 0x1000)
+        cpu.mem_map(0x50000000, 0x1000)
+        cpu.mem_write(0x50000400, struct.pack("<I", 0x10))
         cpu.mem_write(0x20010000, image)
         cpu.mem_write(0x20011A0C, struct.pack("<I", 1))
         cpu.mem_write(0x20011A42, bytes.fromhex("81010cafa603c10522ff"))
@@ -48,7 +52,7 @@ class CaseHandshake(unittest.TestCase):
         incoming = deque(beacon + acknowledgement)
         request = hold(0x32524C45)
         command = b"G2TX" + bytes([len(request)]) + request
-        outgoing = deque(command + bytes([sum(command) & 255]))
+        outgoing = deque(command + bytes([(sum(command) ^ bad_checksum) & 255]))
         sent, console = [], []
 
         def read(c, access, address, size, value, data):
@@ -62,6 +66,8 @@ class CaseHandshake(unittest.TestCase):
                 c.mem_write(address, struct.pack("<I", incoming.popleft()))
 
         def call(c, address, size, data):
+            if address == 0x0800A794:
+                self.assertFalse(outgoing, "watchdog pulse interrupted host reception")
             if address in (0x20010348, 0x2001057C):
                 packet = bytes(
                     c.mem_read(c.reg_read(UC_ARM_REG_R0), c.reg_read(UC_ARM_REG_R1))
@@ -80,6 +86,7 @@ class CaseHandshake(unittest.TestCase):
                 0x20011400,
                 0x08006C80,
                 0x08006CF8,
+                0x0800A794,
             ):
                 return
             c.reg_write(UC_ARM_REG_PC, c.reg_read(UC_ARM_REG_LR))
@@ -112,3 +119,9 @@ class CaseHandshake(unittest.TestCase):
         self.assertTrue(ready)
         self.assertEqual(console[2], beacon)
         self.assertEqual(console[-1][6:-1], acknowledgement)
+
+    def test_bad_checksum_exits_without_feeding_or_transmitting(self):
+        ready, sent, console = self.exchange(hello(123), okay(123), bad_checksum=True)
+        self.assertTrue(ready)
+        self.assertEqual(sent, [])
+        self.assertFalse(any(p.startswith(b"G2RX") for p in console))

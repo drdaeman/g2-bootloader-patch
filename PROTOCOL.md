@@ -380,9 +380,47 @@ Each temple transmission uses a local polling timeout of 21 ticks
 before transmission to allow the direction to change.
 
 These time limits require the scheduler and tick counter to continue to run.
-They give no independent hardware-watchdog guarantee. There is no execution
-timeout. Recovery from a faulty program or a program that does not return is
-not guaranteed.
+While held, the higher-priority manager feeds the nPM1300 watchdog immediately,
+then every 5120 ticks (5 s), retrying a failed/busy-bus feed after 1024 ticks.
+The bounded IOM7 operation restores its temporary power and interrupt state and
+writes only WATCHDOGKICK, preserving the configured watchdog deadline. Before
+each kick it reads TIMERCONFIG and the target bytes, accepting only the measured
+watchdog-reset / 2 ms / 0x003c00 profile (30.72 s). Status and reserved bytes are
+not configuration. An unexpected profile is not fed or reconfigured. It
+requires the observed stock pin/bus state; it does not take over an active bus.
+After deleting a claimed session's worker, the manager makes one final bounded,
+best-effort kick, including sessions released before its first checkpoint. A
+successful kick gives the following boot path a fresh period; failure does not
+block release. The launched application owns subsequent watchdog service.
+
+Interrupts are masked during the temporary IOM7 ownership. All power/bus polls
+share a 250,000-CPU-cycle DWT deadline and a 32,768-poll fallback if CYCCNT is
+unavailable or frozen. The cycle limit is about 2.60 ms at 96 MHz or 1 ms at
+250 MHz, plus setup/cleanup overhead; the fallback is an iteration bound, not
+a measured silicon time guarantee. Debug-enable state is restored and CYCCNT
+is never reset. A timeout can cause UART data loss and a session abort. An
+aborted write can leave a partially written destination; no rollback is implied.
+
+The case independently feeds its stock PB2 watchdog on the first complete host
+packet, then at most once per 5 s of hardware TIM2 time, even during packet
+bursts. TIM2 must be unused/clock-gated on entry; the relay resets/gates it on
+exit. Pulses run between packets only, and receive waits remain bounded.
+The interval assumes the pinned stock 64 MHz timer clock; no interrupt-driven
+software tick is used while the case masks interrupts.
+
+The case does not feed while awaiting host bytes or a temple reply. An idle
+host, incomplete packet, or long-running program producing no replies can
+exhaust the relay's bounded polling wait and exit; the case watchdog is also
+not protected during that silence. Thus an unlimited temple hold does not
+imply an unlimited case relay wait. Programs using this transport must return
+or exchange callback frames within the relay's receive bound. These loop-count
+bounds are not specified in wall-clock seconds. Supporting arbitrary pauses
+needs a nonblocking pulse mechanism, not a blocking pulse inside UART reception.
+
+There is no execution timeout. A nonreturning program that allows the manager
+to run can keep the temple alive; masked interrupts, persistent PMIC-bus
+ownership or scheduler failure can prevent feeding and cause reset. Recovery
+from arbitrary faulty code is not guaranteed.
 
 ## Uploaded MRAM recovery writer
 

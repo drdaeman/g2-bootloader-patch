@@ -13,6 +13,66 @@
 #define TX_PROFILE ((void (*)(void))0x08006cf9u)
 #define ISR W(0x4000481cu)
 #define RDR W(0x40004824u)
+#define CASE_TIM2 0x40000000u
+#define CASE_APB_ENABLE 0x4002103cu
+#define CASE_APB_RESET 0x4002102cu
+
+/* TIM2 is unused in the pinned stock case. Own it only while clock-gated off
+ * at entry; never borrow an active stock timer. At the stock 64 MHz timer
+ * clock, /64000 gives a free-running 32-bit millisecond count without IRQs.
+ * Register layout: ST cmsis-device-g0 Include/stm32g0b1xx.h.
+ */
+__attribute__((used, noinline)) static int case_watchdog_start(void) {
+    if ((W(CASE_APB_ENABLE) & 1u) || (W(CASE_APB_RESET) & 1u))
+        return 0;
+    W(CASE_APB_ENABLE) |= 1u;
+    (void)W(CASE_APB_ENABLE);
+    W(CASE_APB_RESET) |= 1u;
+    W(CASE_APB_RESET) &= ~1u;
+    W(CASE_TIM2 + 0x28u) = 63999u;
+    W(CASE_TIM2 + 0x2cu) = 0xffffffffu;
+    W(CASE_TIM2 + 0x14u) = 1u; /* UG loads the prescaler; DIER stays reset. */
+    W(CASE_TIM2 + 0x10u) = 0;
+    W(CASE_TIM2) = 1u;
+    return 1;
+}
+
+__attribute__((used, noinline)) static void case_watchdog_stop(void) {
+    W(CASE_TIM2) = 0;
+    W(CASE_APB_RESET) |= 1u;
+    W(CASE_APB_RESET) &= ~1u;
+    W(CASE_APB_ENABLE) &= ~1u;
+}
+
+/* Stock 1.2.57 PB2 external-watchdog pulse. The stock wrapper uses .data
+ * pointers that are not valid after ROM-loader entry. Use the configured pin
+ * directly and only the hash-pinned, RAM-independent busy-delay leaf.
+ * Run between complete packets: its low pulse must not block UART reception.
+ */
+__attribute__((used, noinline)) static int case_watchdog_feed(void) {
+    if ((W(0x50000400u) & 0x30u) != 0x10u)
+        return 0;
+    W(0x50000418u) = 4u;
+    ((void (*)(unsigned))0x0800a795u)(350u);
+    W(0x50000418u) = 4u << 16;
+    for (unsigned i = 0; i < 40u; i++)
+        ((void (*)(unsigned))0x0800a795u)(350u);
+    W(0x50000418u) = 4u;
+    return 1;
+}
+
+/* One feed immediately, then at most once per five seconds, regardless of
+ * packet count. Read again after the pulse so its cost cannot shorten the gap.
+ */
+__attribute__((used, noinline)) static int case_watchdog_service(uint32_t *last) {
+    uint32_t now = W(CASE_TIM2 + 0x24u);
+    if ((uint32_t)(now - *last) < 5000u)
+        return 1;
+    if (!case_watchdog_feed())
+        return 0;
+    *last = W(CASE_TIM2 + 0x24u);
+    return 1;
+}
 
 static int receive(uint8_t *p, unsigned limit) {
     unsigned at = 0;
@@ -76,6 +136,9 @@ static unsigned relay_receive(uint8_t *p) {
 void exchange(void) {
     if (!reset_claim())
         return;
+    if (!case_watchdog_start())
+        return;
+    uint32_t last_feed = W(CASE_TIM2 + 0x24u) - 5000u;
     /* Console packets G2TX,len,data,sum; G2EX exits. One temple reply per
      * operation, so callback DATA/ACK never races a second output frame. */
     uint8_t p[33], console[39], head[5];
@@ -99,6 +162,8 @@ void exchange(void) {
         for (unsigned i = 0; i < n; i++)
             sum += p[i];
         if (p[n] != (uint8_t)sum)
+            break;
+        if (!case_watchdog_service(&last_feed))
             break;
         if (n) {
             if (p[0] != 0x7e || p[1] != 0 || p[2] != 1 || p[3] != n - 5u)
@@ -129,4 +194,5 @@ void exchange(void) {
         HOST_SEND(console, n + 7);
     }
     RESULT[11] = RESULT[12] = 0;
+    case_watchdog_stop();
 }
