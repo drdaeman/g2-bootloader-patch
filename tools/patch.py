@@ -12,8 +12,8 @@ from g2patch.auth import key_id
 from g2patch.firmware import (
     APP_BASE,
     BASE,
-    HOOKS,
     PAGE_BYTES,
+    PATCHES,
     STOCK_BYTES,
     STOCK_SHA,
     extract_stock,
@@ -24,22 +24,22 @@ from g2patch.firmware import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_hooks(build=ROOT / "build"):
-    return {name: (build / f"{name}.bin").read_bytes() for name, _, _ in HOOKS}
+def load_patches(build=ROOT / "build"):
+    return {name: (build / f"{name}.bin").read_bytes() for name, _, _ in PATCHES}
 
 
-def patch(stock, blob, hooks):
+def patch(stock, blob, patches):
     if sha(stock[:STOCK_BYTES]) != STOCK_SHA:
         raise ValueError("stock bootloader identity mismatch")
-    if set(hooks) != {name for name, _, _ in HOOKS}:
-        raise ValueError("expected exactly the reviewed hooks")
+    if set(patches) != {name for name, _, _ in PATCHES}:
+        raise ValueError("expected exactly the reviewed patches")
     image = bytearray(stock[:STOCK_BYTES])
-    for name, offset, call in HOOKS:
-        if len(hooks[name]) != 4:
-            raise ValueError(f"{name} must be one linked Thumb BL")
-        if image[offset : offset + 4] != call:
-            raise ValueError("stock call mismatch")
-        image[offset : offset + 4] = hooks[name]
+    for name, offset, original in PATCHES:
+        if len(patches[name]) != len(original):
+            raise ValueError(f"{name} has the wrong replacement size")
+        if image[offset : offset + len(original)] != original:
+            raise ValueError(f"{name} original bytes mismatch")
+        image[offset : offset + len(original)] = patches[name]
     image.extend(blob)
     image.extend(bytes(-len(image) % 4))
     raw_bytes = len(image)
@@ -100,7 +100,7 @@ def main():
     stock, offset = extract_stock(a.firmware.read_bytes())
     subprocess.run(["make", "-C", str(ROOT), "build/patch.bin"], check=True)
     image, raw_bytes = patch(
-        stock, (ROOT / "build/patch.bin").read_bytes(), load_hooks()
+        stock, (ROOT / "build/patch.bin").read_bytes(), load_patches()
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(image)
@@ -108,7 +108,7 @@ def main():
         "stock_sha256": STOCK_SHA,
         "source_offset": offset,
         "base": BASE,
-        "hooks": {name: BASE + offset for name, offset, _ in HOOKS},
+        "patches": {name: BASE + offset for name, offset, _ in PATCHES},
         "raw_bytes": raw_bytes,
         "raw_sha256": sha(image[:raw_bytes]),
         "bytes": len(image),

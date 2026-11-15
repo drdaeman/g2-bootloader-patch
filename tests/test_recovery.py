@@ -384,12 +384,12 @@ class RecoveryWorkflow(unittest.TestCase):
             with self.subTest(failure=failure):
                 self.run_workflow(failure)
 
-    def test_preflight_rejects_wrong_stock_before_reading_flag(self):
+    def test_preflight_rejects_unknown_image_before_reading_flag(self):
         recovery = Recovery(Mock(), {})
-        recovery.read = Mock(return_value=bytes(firmware.STOCK_BYTES))
-        with self.assertRaisesRegex(ValueError, "supported stock"):
+        recovery.read = Mock(return_value=bytes(firmware.PATCHED_BYTES))
+        with self.assertRaisesRegex(ValueError, "known-good bootloader"):
             recovery.preflight()
-        recovery.read.assert_called_once()
+        recovery.read.assert_called_once_with(firmware.BASE, firmware.PATCHED_BYTES)
 
 
 class AddressAcknowledgement(unittest.TestCase):

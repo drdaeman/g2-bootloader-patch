@@ -28,6 +28,24 @@ to read the bootloader CRC through the RAM ABI below. It adds no protocol
 commands. Verification requires the `make all` build files. The tool checks
 these files before OTA starts.
 
+## Storage initialization
+
+NOR and filesystem initialization run after the authenticated UART2 probe
+returns. The probe runs in the manager thread after kernel and UART setup,
+so NOR or filesystem failure cannot prevent the case recovery session.
+While boot is held, the stock NOR handle and filesystem are uninitialized.
+A RAM program that accesses NOR must supply its own initialization; the MRAM
+recovery writer needs none.
+
+CONTINUE initializes storage before updater dispatch. Pending-update handling,
+both application handoff hooks, wire version 2 and RAM API version 3 are
+unchanged. Storage deferral is always enabled.
+
+Recovery preflight accepts only complete patched images whose SHA-256 is in
+`KNOWN_BOOTLOADER_SHAS` in `tools/g2patch/firmware.py`. Each entry identifies
+a hardware-tested release. Unknown or modified images are refused before the
+pending-update record is read; adding a new build requires an allowlist update.
+
 ## Packet format
 
 All offsets start at zero. Integer fields are unsigned and little-endian.

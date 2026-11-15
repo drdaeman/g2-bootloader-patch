@@ -336,13 +336,13 @@ class StockBindings(unittest.TestCase):
         stock, _ = firmware.extract_stock(
             (ROOT / "build/official-2.3.2.14.bin").read_bytes()
         )
-        for name, offset, call in firmware.HOOKS:
-            self.assertEqual(stock[offset : offset + 4], call)
-        for name, offset, call in firmware.HOOKS[1:]:
-            with self.subTest(hook=name):
-                self.assertEqual(
-                    firmware.bl_target(offset, call), HANDOFF - firmware.BASE
-                )
+        for name, offset, original in firmware.PATCHES:
+            self.assertEqual(stock[offset : offset + len(original)], original)
+            if name in ("hook_handoff_update", "hook_handoff_boot"):
+                with self.subTest(patch=name):
+                    self.assertEqual(
+                        firmware.bl_target(offset, original), HANDOFF - firmware.BASE
+                    )
         leaf = HANDOFF - firmware.BASE
         # movw/movt r1, VTOR; str r0,[r1]; ldr sp,[r0]; ldr r1,[r0,#4]; bx r1
         self.assertEqual(

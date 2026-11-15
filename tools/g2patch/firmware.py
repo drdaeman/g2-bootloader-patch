@@ -10,15 +10,27 @@ BASE = 0x00410000
 APP_BASE = 0x00438000
 PART_BYTES = APP_BASE - BASE
 STOCK_BYTES = 149760
+# Unmodified Even 2.3.2.14 bootloader, 149,760 bytes.
 STOCK_SHA = "22a2b98e606b4d296e957a3a8b600a2158497638d79485c817c2025536329ba7"
-# (build artifact, partition offset, stock Thumb BL). The manager's update-flag
-# call, then the DFU task's two calls of the vector handoff leaf at 0x42DFD8.
-HOOKS = (
+# (replacement build artifact, partition offset, expected original bytes).
+PATCHES = (
+    # Manager's pending-update flag call.
     ("hook", 0x0042E656 - BASE, bytes.fromhex("fff789ff")),
+    # DFU task's two calls of the vector handoff leaf at 0x42DFD8.
     ("hook_handoff_update", 0x0042E3D4 - BASE, bytes.fromhex("fff700fe")),
     ("hook_handoff_boot", 0x0042E440 - BASE, bytes.fromhex("fff7cafd")),
+    # Replace the first halfword of the redundant heap BL with a short branch
+    # past the heap/NOR/filesystem calls. Its old second halfword is skipped.
+    ("hook_storage_startup", 0x0041B89E - BASE, bytes.fromhex("04f0")),
 )
-HOOK, OLD_CALL = HOOKS[0][1:]
+PATCHED_BYTES = 159744
+# Complete, hardware-tested patched images; hashes include page padding.
+KNOWN_BOOTLOADER_SHAS = {
+    # 2.3.2.14, wire 2 / RAM API 3, before storage deferral (6198d70).
+    "06f8a8d59f6351461aa9ce45cbc2a6697172cdca872ec77552325301ae175cc4",
+    # 2.3.2.14, wire 2 / RAM API 3, with storage deferral.
+    "7010d103d02a49333362ec185fb04c9657626f97cec5240063375d1c52e55a7e",
+}
 PAGE_BYTES = 4096
 FILENAME = "ota/s200_bootloader.bin"
 # EvenOTA uses the Castagnoli polynomial without reflection or final XOR.
@@ -81,14 +93,6 @@ def extract_stock(data):
     )
 
 
-def restore_hooks(image):
-    """Copy of the stock-length prefix with every reviewed hook reverted."""
-    prefix = bytearray(image[:STOCK_BYTES])
-    for _name, offset, call in HOOKS:
-        prefix[offset : offset + 4] = call
-    return prefix
-
-
 def bl_target(offset, call):
     first, second = struct.unpack("<HH", call)
     if first & 0xF800 != 0xF000 or second & 0xD000 != 0xD000:
@@ -109,17 +113,17 @@ def bl_target(offset, call):
 def validate_image(image):
     if not STOCK_BYTES <= len(image) <= PART_BYTES:
         raise ValueError("boot image exceeds its partition or is truncated")
-    if sha(restore_hooks(image)) != STOCK_SHA:
-        raise ValueError("stock code/vectors changed outside the reviewed hooks")
-    patched = [image[offset : offset + 4] != call for _name, offset, call in HOOKS]
-    if any(patched) and not all(patched):
-        raise ValueError("only some of the reviewed hooks are installed")
-    for _name, offset, call in HOOKS:
-        if image[offset : offset + 4] != call:
-            target = bl_target(offset, image[offset : offset + 4])
-            if not STOCK_BYTES <= target < len(image):
-                raise ValueError("hook target lies outside appended code")
-    return image + b"\xff" * ((-len(image)) % PAGE_BYTES)
+    for length, hashes in (
+        (STOCK_BYTES, {STOCK_SHA}),
+        (PATCHED_BYTES, KNOWN_BOOTLOADER_SHAS),
+    ):
+        if (
+            len(image) >= length
+            and sha(image[:length]) in hashes
+            and all(b == 0xFF for b in image[length:])
+        ):
+            return image + b"\xff" * ((-len(image)) % PAGE_BYTES)
+    raise ValueError("unsupported bootloader image SHA-256")
 
 
 def component(image):

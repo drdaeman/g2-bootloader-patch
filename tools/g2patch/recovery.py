@@ -143,9 +143,12 @@ class Recovery:
         return result
 
     def preflight(self):
-        prefix = self.read(firmware.BASE, firmware.STOCK_BYTES)
-        if firmware.sha(firmware.restore_hooks(prefix)) != firmware.STOCK_SHA:
-            raise ValueError("temple does not contain the supported stock bootloader")
+        image = self.read(firmware.BASE, firmware.PATCHED_BYTES)
+        if (
+            len(image) != firmware.PATCHED_BYTES
+            or firmware.sha(image) not in firmware.KNOWN_BOOTLOADER_SHAS
+        ):
+            raise ValueError("temple does not contain a known-good bootloader image")
         flag = self.read(UPDATE_FLAG, 4)
         return flag
 

@@ -38,68 +38,71 @@ class ChecksumTests(unittest.TestCase):
 
 class FirmwareTests(unittest.TestCase):
     def setUp(self):
-        self.stock = bytearray(firmware.STOCK_BYTES)
-        self.stock[:8] = struct.pack("<II", 0x2007FB00, 0x432CA3)
-        for _name, offset, call in firmware.HOOKS:
-            self.stock[offset : offset + 4] = call
-        digest = firmware.sha(self.stock)
-        self.a = mock_patch.object(firmware, "STOCK_SHA", digest)
-        self.a.start()
-        self.b = mock_patch.object(patcher, "STOCK_SHA", digest)
-        self.b.start()
-        self.addCleanup(self.a.stop)
-        self.addCleanup(self.b.stop)
+        stock, _ = firmware.extract_stock(
+            (ROOT / "build/official-2.3.2.14.bin").read_bytes()
+        )
+        self.stock = bytearray(stock[: firmware.STOCK_BYTES])
         self.blob = (ROOT / "build/patch.bin").read_bytes()
-        self.hooks = patcher.load_hooks()
+        self.patches = patcher.load_patches()
 
     def test_patch_preserves_vectors_code_and_captured_tail(self):
-        source = bytes(self.stock) + b"\xa5" * (firmware.PART_BYTES - len(self.stock))
-        result, raw = patcher.patch(source, self.blob, self.hooks)
+        source = bytes(self.stock) + b"\xff" * (firmware.PART_BYTES - len(self.stock))
+        result, raw = patcher.patch(source, self.blob, self.patches)
         self.assertEqual(result[:8], source[:8])
         changed = [i for i in range(firmware.STOCK_BYTES) if result[i] != source[i]]
         hooked = {
             offset + i
-            for _name, offset, call in firmware.HOOKS
-            for i in range(4)
-            if self.hooks[_name][i] != call[i]
+            for _name, offset, call in firmware.PATCHES
+            for i in range(len(call))
+            if self.patches[_name][i] != call[i]
         }
         self.assertEqual(set(changed), hooked)
-        for name, offset, _call in firmware.HOOKS:
-            self.assertEqual(result[offset : offset + 4], self.hooks[name])
-            target = firmware.bl_target(offset, self.hooks[name])
-            self.assertTrue(firmware.STOCK_BYTES <= target < raw)
+        for name, offset, original in firmware.PATCHES:
+            self.assertEqual(
+                result[offset : offset + len(original)], self.patches[name]
+            )
+            # These particular patches replace calls; the table itself is
+            # independent of instruction encoding.
+            if name in ("hook", "hook_handoff_update", "hook_handoff_boot"):
+                target = firmware.bl_target(offset, self.patches[name])
+                self.assertTrue(firmware.STOCK_BYTES <= target < raw)
         self.assertEqual(result[raw:], source[raw : len(result)])
         self.assertEqual(len(result) % 4096, 0)
         self.assertEqual(firmware.validate_image(result), result)
 
     def test_missing_padding_is_explicitly_filled_not_taken_from_other_components(self):
-        result, raw = patcher.patch(bytes(self.stock), self.blob, self.hooks)
+        result, raw = patcher.patch(bytes(self.stock), self.blob, self.patches)
         self.assertEqual(result[raw:], b"\xff" * (len(result) - raw))
+
+    def test_unknown_captured_padding_is_not_an_admitted_deferral_image(self):
+        source = bytes(self.stock) + b"\xa5" * (firmware.PART_BYTES - len(self.stock))
+        with self.assertRaises(ValueError):
+            patcher.patch(source, self.blob, self.patches)
 
     def test_wrong_version_out_of_partition_and_bad_hook_rejected(self):
         changed = bytearray(self.stock)
         changed[10] ^= 1
         with self.assertRaises(ValueError):
-            patcher.patch(changed, self.blob, self.hooks)
+            patcher.patch(changed, self.blob, self.patches)
         with self.assertRaises(ValueError):
-            patcher.patch(self.stock, bytes(firmware.PART_BYTES), self.hooks)
+            patcher.patch(self.stock, bytes(firmware.PART_BYTES), self.patches)
         with self.assertRaises(ValueError):
-            patcher.patch(self.stock, self.blob, {"hook": self.hooks["hook"]})
-        image, _ = patcher.patch(self.stock, self.blob, self.hooks)
-        for _name, offset, _call in firmware.HOOKS:
+            patcher.patch(self.stock, self.blob, {"hook": self.patches["hook"]})
+        image, _ = patcher.patch(self.stock, self.blob, self.patches)
+        for _name, offset, original in firmware.PATCHES:
             changed = bytearray(image)
-            changed[offset : offset + 4] = bytes(4)
+            changed[offset : offset + len(original)] = bytes(len(original))
             with self.subTest(hook=_name), self.assertRaises(ValueError):
                 firmware.component(changed)
 
     def test_partially_hooked_image_is_rejected(self):
-        image, _ = patcher.patch(self.stock, self.blob, self.hooks)
-        for _name, offset, call in firmware.HOOKS:
+        image, _ = patcher.patch(self.stock, self.blob, self.patches)
+        for _name, offset, call in firmware.PATCHES:
             changed = bytearray(image)
-            changed[offset : offset + 4] = call
+            changed[offset : offset + len(call)] = call
             with (
                 self.subTest(hook=_name),
-                self.assertRaisesRegex(ValueError, "only some"),
+                self.assertRaises(ValueError),
             ):
                 firmware.validate_image(changed)
 
@@ -138,7 +141,7 @@ class BuildPins(unittest.TestCase):
     def test_pinned_artifacts_reproduce(self):
         # Reproducible default-key build pins.
         pins = {
-            "patch": "8d3836ae656dd70dd2b711381784e0f5b2a536696557253cced41b55446974bf",
+            "patch": "9a553b5a4fa0788655c21c1566d4c521a6c5db694b1dff6b4a7385da4be7b8e9",
             "case": "004ce36d9cf8d77e2931e27574f34f34a219a92699b9b44e09c8b0e9f93225a9",
             "echo": "50e2d81ef7b26978ab8be1c722a27924b06217945ae7c4cd9c92beb39a9590dc",
         }
